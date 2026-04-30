@@ -1,0 +1,627 @@
+#include <Arduino.h>
+#include <Arduino_CAN.h>
+
+// --------------------------------------------------
+// Dummy wheelchair skeleton for 2 VESCs over CAN bus
+// Arduino GIGA + NEXT Shield + PlatformIO / Arduino IDE
+//
+// DRY_RUN = true  -> safe test, only prints what it would do
+// DRY_RUN = false -> actually sends CAN commands to the VESCs
+// --------------------------------------------------
+
+constexpr bool DRY_RUN = true;
+
+// Your NEXT shield schematic connects MCP2562 STBY to D7.
+// LOW = normal CAN mode
+// HIGH = standby mode
+constexpr int CAN_STBY_PIN = 7;
+
+// Change these to match the CAN IDs set in VESC Tool
+constexpr uint8_t LEFT_VESC_ID  = 1;
+constexpr uint8_t RIGHT_VESC_ID = 2;
+
+// Must match VESC Tool CAN baudrate.
+// Common VESC values are 500k or 250k.
+constexpr CanBitRate CAN_BAUD = CanBitRate::BR_500k;
+
+// Safety timings
+constexpr unsigned long CMD_TIMEOUT_MS = 500;
+constexpr unsigned long KEEPALIVE_MS   = 100;
+
+// VESC CAN packet IDs
+enum VescCanPacket {
+  CAN_PACKET_SET_DUTY          = 0,
+  CAN_PACKET_SET_CURRENT       = 1,
+  CAN_PACKET_SET_CURRENT_BRAKE = 2,
+  CAN_PACKET_SET_RPM           = 3,
+  CAN_PACKET_SET_POS           = 4,
+  CAN_PACKET_STATUS            = 9,
+  CAN_PACKET_STATUS_2          = 14,
+  CAN_PACKET_STATUS_3          = 15,
+  CAN_PACKET_STATUS_4          = 16,
+  CAN_PACKET_STATUS_5          = 27
+};
+
+enum MotionState {
+  STOPPED,
+  FORWARD,
+  REVERSE,
+  LEFT,
+  RIGHT
+};
+
+enum ControlMode {
+  MODE_DUTY,
+  MODE_RPM,
+  MODE_CURRENT
+};
+
+bool driveEnabled = false;
+MotionState motion = STOPPED;
+ControlMode controlMode = MODE_DUTY;
+
+float leftTarget = 0.0f;
+float rightTarget = 0.0f;
+
+unsigned long lastCmdMs = 0;
+unsigned long lastKeepAliveMs = 0;
+
+// ---------- telemetry storage ----------
+
+struct VescTelemetry {
+  bool seen = false;
+  int32_t rpm = 0;
+  float inputVoltage = 0.0f;
+  float duty = 0.0f;
+  float motorCurrent = 0.0f;
+  float inputCurrent = 0.0f;
+  float tempFet = 0.0f;
+};
+
+VescTelemetry leftTelemetry;
+VescTelemetry rightTelemetry;
+
+// ---------- helper text ----------
+
+const char* motionToString(MotionState s) {
+  switch (s) {
+    case STOPPED: return "STOP";
+    case FORWARD: return "FORWARD";
+    case REVERSE: return "REVERSE";
+    case LEFT:    return "LEFT";
+    case RIGHT:   return "RIGHT";
+    default:      return "UNKNOWN";
+  }
+}
+
+const char* modeToString(ControlMode m) {
+  switch (m) {
+    case MODE_DUTY:    return "DUTY";
+    case MODE_RPM:     return "RPM";
+    case MODE_CURRENT: return "CURRENT";
+    default:           return "UNKNOWN";
+  }
+}
+
+void printHelp() {
+  Serial.println();
+  Serial.println("=== Dummy Chair + VESC CAN Skeleton ===");
+  Serial.println("h = help");
+  Serial.println("e = enable drive");
+  Serial.println("d = disable drive");
+  Serial.println("f = forward");
+  Serial.println("b = reverse");
+  Serial.println("l = left");
+  Serial.println("r = right");
+  Serial.println("s = stop");
+  Serial.println("p = print status");
+  Serial.println("1 = control mode DUTY");
+  Serial.println("2 = control mode RPM");
+  Serial.println("3 = control mode CURRENT");
+  Serial.println("t = print latest telemetry");
+  Serial.println("=======================================");
+  Serial.println();
+}
+
+void printStatus() {
+  Serial.print("Drive enabled: ");
+  Serial.println(driveEnabled ? "YES" : "NO");
+
+  Serial.print("Motion: ");
+  Serial.println(motionToString(motion));
+
+  Serial.print("Control mode: ");
+  Serial.println(modeToString(controlMode));
+
+  Serial.print("Left target: ");
+  Serial.println(leftTarget, 3);
+
+  Serial.print("Right target: ");
+  Serial.println(rightTarget, 3);
+
+  Serial.print("DRY_RUN: ");
+  Serial.println(DRY_RUN ? "true" : "false");
+
+  Serial.println();
+}
+
+// ---------- byte helpers ----------
+
+void bufferAppendInt32(uint8_t *buffer, int32_t number) {
+  buffer[0] = (number >> 24) & 0xFF;
+  buffer[1] = (number >> 16) & 0xFF;
+  buffer[2] = (number >> 8)  & 0xFF;
+  buffer[3] = number & 0xFF;
+}
+
+int32_t bufferGetInt32(const uint8_t *buffer) {
+  return ((int32_t)buffer[0] << 24) |
+         ((int32_t)buffer[1] << 16) |
+         ((int32_t)buffer[2] << 8)  |
+         ((int32_t)buffer[3]);
+}
+
+int16_t bufferGetInt16(const uint8_t *buffer) {
+  return ((int16_t)buffer[0] << 8) | buffer[1];
+}
+
+// ---------- VESC CAN send functions ----------
+
+// VESC extended CAN ID:
+// upper bits = command
+// lower 8 bits = VESC CAN ID
+uint32_t makeVescCanId(uint8_t vescId, uint8_t command) {
+  return ((uint32_t)command << 8) | vescId;
+}
+
+void sendVescFrame(uint8_t vescId, uint8_t command, const uint8_t *data, uint8_t len) {
+  uint32_t canId = makeVescCanId(vescId, command);
+
+  if (DRY_RUN) {
+    Serial.print("[DRY] EXT CAN ID 0x");
+    Serial.print(canId, HEX);
+    Serial.print("  VESC ");
+    Serial.print(vescId);
+    Serial.print("  CMD ");
+    Serial.print(command);
+    Serial.print("  DATA:");
+    for (uint8_t i = 0; i < len; i++) {
+      Serial.print(" 0x");
+      if (data[i] < 16) Serial.print("0");
+      Serial.print(data[i], HEX);
+    }
+    Serial.println();
+    return;
+  }
+
+  CanMsg msg(CanExtendedId(canId), len, data);
+  CAN.write(msg);
+}
+
+void vescSetDuty(uint8_t vescId, float duty) {
+  // VESC expects duty scaled by 100000.
+  // Example: 0.10 = 10% duty
+  int32_t value = (int32_t)(duty * 100000.0f);
+
+  uint8_t data[4];
+  bufferAppendInt32(data, value);
+
+  sendVescFrame(vescId, CAN_PACKET_SET_DUTY, data, 4);
+}
+
+void vescSetRPM(uint8_t vescId, float rpm) {
+  int32_t value = (int32_t)rpm;
+
+  uint8_t data[4];
+  bufferAppendInt32(data, value);
+
+  sendVescFrame(vescId, CAN_PACKET_SET_RPM, data, 4);
+}
+
+void vescSetCurrent(uint8_t vescId, float currentAmps) {
+  // VESC expects current scaled by 1000.
+  // Positive current = one direction
+  // Negative current = opposite direction
+  int32_t value = (int32_t)(currentAmps * 1000.0f);
+
+  uint8_t data[4];
+  bufferAppendInt32(data, value);
+
+  sendVescFrame(vescId, CAN_PACKET_SET_CURRENT, data, 4);
+}
+
+void vescSetBrakeCurrent(uint8_t vescId, float brakeCurrentAmps) {
+  // Brake current should be positive.
+  int32_t value = (int32_t)(brakeCurrentAmps * 1000.0f);
+
+  uint8_t data[4];
+  bufferAppendInt32(data, value);
+
+  sendVescFrame(vescId, CAN_PACKET_SET_CURRENT_BRAKE, data, 4);
+}
+
+// ---------- motor wrapper functions ----------
+
+void sendMotorCommand(uint8_t vescId, const char* sideName, float value) {
+  Serial.print(sideName);
+  Serial.print(" target -> ");
+  Serial.println(value, 3);
+
+  switch (controlMode) {
+    case MODE_DUTY:
+      vescSetDuty(vescId, value);
+      break;
+
+    case MODE_RPM:
+      vescSetRPM(vescId, value);
+      break;
+
+    case MODE_CURRENT:
+      vescSetCurrent(vescId, value);
+      break;
+  }
+}
+
+void sendLeftCommand(float value) {
+  sendMotorCommand(LEFT_VESC_ID, "LEFT", value);
+}
+
+void sendRightCommand(float value) {
+  sendMotorCommand(RIGHT_VESC_ID, "RIGHT", value);
+}
+
+void sendKeepaliveBoth() {
+  if (motion != STOPPED) {
+    sendLeftCommand(leftTarget);
+    sendRightCommand(rightTarget);
+  }
+}
+
+void stopMotors() {
+  leftTarget = 0.0f;
+  rightTarget = 0.0f;
+  motion = STOPPED;
+
+  sendLeftCommand(0.0f);
+  sendRightCommand(0.0f);
+
+  Serial.println("Motors -> STOP");
+}
+
+void setMotors(float left, float right, MotionState newMotion) {
+  if (!driveEnabled) {
+    Serial.println("Drive disabled. Press 'e' first.");
+    return;
+  }
+
+  leftTarget = left;
+  rightTarget = right;
+  motion = newMotion;
+  lastCmdMs = millis();
+
+  sendLeftCommand(leftTarget);
+  sendRightCommand(rightTarget);
+
+  Serial.print("Motion -> ");
+  Serial.println(motionToString(motion));
+}
+
+// ---------- movement mapping ----------
+
+void commandForward() {
+  switch (controlMode) {
+    case MODE_DUTY:
+      setMotors(0.10f, 0.10f, FORWARD);
+      break;
+
+    case MODE_RPM:
+      setMotors(1000.0f, 1000.0f, FORWARD);
+      break;
+
+    case MODE_CURRENT:
+      setMotors(2.0f, 2.0f, FORWARD);
+      break;
+  }
+}
+
+void commandReverse() {
+  switch (controlMode) {
+    case MODE_DUTY:
+      setMotors(-0.10f, -0.10f, REVERSE);
+      break;
+
+    case MODE_RPM:
+      setMotors(-1000.0f, -1000.0f, REVERSE);
+      break;
+
+    case MODE_CURRENT:
+      setMotors(-2.0f, -2.0f, REVERSE);
+      break;
+  }
+}
+
+void commandLeft() {
+  switch (controlMode) {
+    case MODE_DUTY:
+      setMotors(-0.08f, 0.08f, LEFT);
+      break;
+
+    case MODE_RPM:
+      setMotors(-700.0f, 700.0f, LEFT);
+      break;
+
+    case MODE_CURRENT:
+      setMotors(-1.5f, 1.5f, LEFT);
+      break;
+  }
+}
+
+void commandRight() {
+  switch (controlMode) {
+    case MODE_DUTY:
+      setMotors(0.08f, -0.08f, RIGHT);
+      break;
+
+    case MODE_RPM:
+      setMotors(700.0f, -700.0f, RIGHT);
+      break;
+
+    case MODE_CURRENT:
+      setMotors(1.5f, -1.5f, RIGHT);
+      break;
+  }
+}
+
+// ---------- telemetry ----------
+
+void printOneTelemetry(const char* name, const VescTelemetry& t) {
+  Serial.print(name);
+  Serial.println(" telemetry:");
+
+  if (!t.seen) {
+    Serial.println("  No CAN status received yet.");
+    return;
+  }
+
+  Serial.print("  RPM: ");
+  Serial.println(t.rpm);
+
+  Serial.print("  Vin: ");
+  Serial.println(t.inputVoltage);
+
+  Serial.print("  Duty: ");
+  Serial.println(t.duty, 3);
+
+  Serial.print("  Motor current: ");
+  Serial.println(t.motorCurrent);
+
+  Serial.print("  Input current: ");
+  Serial.println(t.inputCurrent);
+
+  Serial.print("  FET temp: ");
+  Serial.println(t.tempFet);
+}
+
+void readTelemetry() {
+  printOneTelemetry("Left", leftTelemetry);
+  printOneTelemetry("Right", rightTelemetry);
+}
+
+void handleCanTelemetry() {
+  if (!CAN.available()) {
+    return;
+  }
+
+  CanMsg const msg = CAN.read();
+
+  if (!msg.isExtendedId()) {
+    return;
+  }
+
+  uint32_t id = msg.getExtendedId();
+
+  uint8_t vescId = id & 0xFF;
+  uint8_t command = (id >> 8) & 0xFF;
+
+  VescTelemetry* t = nullptr;
+
+  if (vescId == LEFT_VESC_ID) {
+    t = &leftTelemetry;
+  } else if (vescId == RIGHT_VESC_ID) {
+    t = &rightTelemetry;
+  } else {
+    return;
+  }
+
+  const uint8_t* data = msg.data;
+  uint8_t len = msg.data_length;
+
+  t->seen = true;
+
+  switch (command) {
+    case CAN_PACKET_STATUS:
+      // STATUS 1:
+      // bytes 0-3: RPM
+      // bytes 4-5: motor current * 10
+      // bytes 6-7: duty * 1000
+      if (len >= 8) {
+        t->rpm = bufferGetInt32(&data[0]);
+        t->motorCurrent = bufferGetInt16(&data[4]) / 10.0f;
+        t->duty = bufferGetInt16(&data[6]) / 1000.0f;
+      }
+      break;
+
+    case CAN_PACKET_STATUS_4:
+      // STATUS 4:
+      // bytes 0-1: FET temp * 10
+      // bytes 4-5: input current * 10
+      if (len >= 6) {
+        t->tempFet = bufferGetInt16(&data[0]) / 10.0f;
+        t->inputCurrent = bufferGetInt16(&data[4]) / 10.0f;
+      }
+      break;
+
+    case CAN_PACKET_STATUS_5:
+      // STATUS 5:
+      // bytes 4-5: input voltage * 10
+      if (len >= 6) {
+        t->inputVoltage = bufferGetInt16(&data[4]) / 10.0f;
+      }
+      break;
+  }
+}
+
+// ---------- drive state ----------
+
+void enableDrive() {
+  driveEnabled = true;
+  lastCmdMs = millis();
+
+  Serial.println("Drive ENABLED");
+  stopMotors();
+}
+
+void disableDrive() {
+  stopMotors();
+  driveEnabled = false;
+
+  Serial.println("Drive DISABLED");
+}
+
+// ---------- serial command handler ----------
+
+void handleCommand(char c) {
+  switch (c) {
+    case 'h':
+    case 'H':
+      printHelp();
+      break;
+
+    case 'e':
+    case 'E':
+      enableDrive();
+      break;
+
+    case 'd':
+    case 'D':
+      disableDrive();
+      break;
+
+    case 'f':
+    case 'F':
+      commandForward();
+      break;
+
+    case 'b':
+    case 'B':
+      commandReverse();
+      break;
+
+    case 'l':
+    case 'L':
+      commandLeft();
+      break;
+
+    case 'r':
+    case 'R':
+      commandRight();
+      break;
+
+    case 's':
+    case 'S':
+      stopMotors();
+      break;
+
+    case 'p':
+    case 'P':
+      printStatus();
+      break;
+
+    case '1':
+      controlMode = MODE_DUTY;
+      Serial.println("Control mode -> DUTY");
+      stopMotors();
+      break;
+
+    case '2':
+      controlMode = MODE_RPM;
+      Serial.println("Control mode -> RPM");
+      stopMotors();
+      break;
+
+    case '3':
+      controlMode = MODE_CURRENT;
+      Serial.println("Control mode -> CURRENT");
+      stopMotors();
+      break;
+
+    case 't':
+    case 'T':
+      readTelemetry();
+      break;
+
+    case '\n':
+    case '\r':
+      break;
+
+    default:
+      Serial.print("Unknown command: ");
+      Serial.println(c);
+      break;
+  }
+}
+
+// ---------- setup / loop ----------
+
+void setup() {
+  Serial.begin(115200);
+  while (!Serial) {;}
+
+  Serial.println();
+  Serial.println("Dummy Chair + VESC CAN Skeleton started.");
+
+  // Enable MCP2562 CAN transceiver on the NEXT shield
+  pinMode(CAN_STBY_PIN, OUTPUT);
+  digitalWrite(CAN_STBY_PIN, LOW);
+
+  if (!DRY_RUN) {
+    if (!CAN.begin(CAN_BAUD)) {
+      Serial.println("CAN.begin(...) failed.");
+      while (1) {
+        delay(100);
+      }
+    }
+
+    Serial.println("CAN started.");
+  } else {
+    Serial.println("DRY_RUN is true, CAN messages will not be sent.");
+  }
+
+  printHelp();
+  printStatus();
+
+  stopMotors();
+}
+
+void loop() {
+  while (Serial.available() > 0) {
+    char c = Serial.read();
+    handleCommand(c);
+  }
+
+  if (!DRY_RUN) {
+    handleCanTelemetry();
+  }
+
+  // Auto-stop if no new command comes in
+  if (driveEnabled && (millis() - lastCmdMs > CMD_TIMEOUT_MS) && motion != STOPPED) {
+    Serial.println("Command timeout -> STOP");
+    stopMotors();
+  }
+
+  // Keep sending last active command so the VESC does not timeout
+  if (driveEnabled && (millis() - lastKeepAliveMs > KEEPALIVE_MS)) {
+    lastKeepAliveMs = millis();
+    sendKeepaliveBoth();
+  }
+}
