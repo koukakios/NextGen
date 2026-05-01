@@ -1,0 +1,425 @@
+#include <Arduino.h>
+#include <VescUart.h>
+
+// --------------------------------------------------
+// Dummy wheelchair skeleton for 2 VESCs over UART
+// Arduino GIGA + PlatformIO
+//
+// DRY_RUN = true  -> safe test, only prints what it would do
+// DRY_RUN = false -> actually sends UART commands to the VESCs
+// --------------------------------------------------
+
+constexpr bool DRY_RUN = false;
+
+// Use two hardware UARTs on the GIGA
+#define LEFT_VESC_SERIAL  Serial1
+#define RIGHT_VESC_SERIAL Serial2
+
+VescUart leftVesc;
+VescUart rightVesc;
+
+enum MotionState {
+  STOPPED,
+  FORWARD,
+  REVERSE,
+  LEFT,
+  RIGHT
+};
+
+bool driveEnabled = false;
+MotionState motion = STOPPED;
+
+float leftTarget = 0.0f;
+float rightTarget = 0.0f;
+
+unsigned long lastCmdMs = 0;
+unsigned long lastKeepAliveMs = 0;
+
+constexpr unsigned long CMD_TIMEOUT_MS = 2000;
+constexpr unsigned long KEEPALIVE_MS   = 100;
+
+// Choose one control mode to start with.
+// For a first skeleton, duty is simplest.
+enum ControlMode {
+  MODE_DUTY,
+  MODE_RPM,
+  MODE_CURRENT
+};
+
+ControlMode controlMode = MODE_RPM;
+
+// ---------- helper text ----------
+
+const char* motionToString(MotionState s) {
+  switch (s) {
+    case STOPPED: return "STOP";
+    case FORWARD: return "FORWARD";
+    case REVERSE: return "REVERSE";
+    case LEFT:    return "LEFT";
+    case RIGHT:   return "RIGHT";
+    default:      return "UNKNOWN";
+  }
+}
+
+const char* modeToString(ControlMode m) {
+  switch (m) {
+    case MODE_DUTY:    return "DUTY";
+    case MODE_RPM:     return "RPM";
+    case MODE_CURRENT: return "CURRENT";
+    default:           return "UNKNOWN";
+  }
+}
+
+void printHelp() {
+  Serial.println();
+  Serial.println("=== Dummy Chair + VESC UART Skeleton ===");
+  Serial.println("h = help");
+  Serial.println("e = enable drive");
+  Serial.println("d = disable drive");
+  Serial.println("f = forward");
+  Serial.println("b = reverse");
+  Serial.println("l = left");
+  Serial.println("r = right");
+  Serial.println("s = stop");
+  Serial.println("p = print status");
+  Serial.println("1 = control mode DUTY");
+  Serial.println("2 = control mode RPM");
+  Serial.println("3 = control mode CURRENT");
+  Serial.println("t = read telemetry");
+  Serial.println("========================================");
+  Serial.println();
+}
+
+void printStatus() {
+  Serial.print("Drive enabled: ");
+  Serial.println(driveEnabled ? "YES" : "NO");
+
+  Serial.print("Motion: ");
+  Serial.println(motionToString(motion));
+
+  Serial.print("Control mode: ");
+  Serial.println(modeToString(controlMode));
+
+  Serial.print("Left target: ");
+  Serial.println(leftTarget, 3);
+
+  Serial.print("Right target: ");
+  Serial.println(rightTarget, 3);
+
+  Serial.print("DRY_RUN: ");
+  Serial.println(DRY_RUN ? "true" : "false");
+  Serial.println();
+}
+
+// ---------- VESC wrapper functions ----------
+
+void sendLeftCommand(float value) {
+  if (DRY_RUN) {
+    Serial.print("[DRY] LEFT  -> ");
+    Serial.println(value, 3);
+    return;
+  }
+
+  switch (controlMode) {
+    case MODE_DUTY:
+      leftVesc.setDuty(value);
+      break;
+
+    case MODE_RPM:
+      leftVesc.setRPM(value);
+      break;
+
+    case MODE_CURRENT:
+      if (value >= 0.0f) {
+        leftVesc.setCurrent(value);
+      } else {
+        leftVesc.setBrakeCurrent(-value);
+      }
+      break;
+  }
+}
+
+void sendRightCommand(float value) {
+  if (DRY_RUN) {
+    Serial.print("[DRY] RIGHT -> ");
+    Serial.println(value, 3);
+    return;
+  }
+
+  switch (controlMode) {
+    case MODE_DUTY:
+      rightVesc.setDuty(value);
+      break;
+
+    case MODE_RPM:
+      rightVesc.setRPM(value);
+      break;
+
+    case MODE_CURRENT:
+      if (value >= 0.0f) {
+        rightVesc.setCurrent(value);
+      } else {
+        rightVesc.setBrakeCurrent(-value);
+      }
+      break;
+  }
+}
+
+void sendKeepaliveBoth() {
+  if (DRY_RUN) {
+    return;
+  }
+
+  leftVesc.sendKeepalive();
+  rightVesc.sendKeepalive();
+}
+
+void stopMotors() {
+  leftTarget = 0.0f;
+  rightTarget = 0.0f;
+  motion = STOPPED;
+
+  sendLeftCommand(0.0f);
+  sendRightCommand(0.0f);
+
+  Serial.println("Motors -> STOP");
+}
+
+void setMotors(float left, float right, MotionState newMotion) {
+  if (!driveEnabled) {
+    Serial.println("Drive disabled. Press 'e' first.");
+    return;
+  }
+
+  leftTarget = left;
+  rightTarget = right;
+  motion = newMotion;
+  lastCmdMs = millis();
+
+  sendLeftCommand(leftTarget);
+  sendRightCommand(rightTarget);
+
+  Serial.print("Motion -> ");
+  Serial.println(motionToString(motion));
+}
+
+// ---------- movement mapping ----------
+
+void commandForward() {
+  switch (controlMode) {
+    case MODE_DUTY:
+      setMotors(0.10f, 0.10f, FORWARD);
+      break;
+    case MODE_RPM:
+      setMotors(10000.0f, 10000.0f, FORWARD);
+      break;
+    case MODE_CURRENT:
+      setMotors(2.0f, 2.0f, FORWARD);
+      break;
+  }
+}
+
+void commandReverse() {
+  switch (controlMode) {
+    case MODE_DUTY:
+      setMotors(-0.10f, -0.10f, REVERSE);
+      break;
+    case MODE_RPM:
+      setMotors(-1000.0f, -1000.0f, REVERSE);
+      break;
+    case MODE_CURRENT:
+      setMotors(-2.0f, -2.0f, REVERSE);
+      break;
+  }
+}
+
+void commandLeft() {
+  switch (controlMode) {
+    case MODE_DUTY:
+      setMotors(-0.08f, 0.08f, LEFT);
+      break;
+    case MODE_RPM:
+      setMotors(-700.0f, 700.0f, LEFT);
+      break;
+    case MODE_CURRENT:
+      setMotors(-1.5f, 1.5f, LEFT);
+      break;
+  }
+}
+
+void commandRight() {
+  switch (controlMode) {
+    case MODE_DUTY:
+      setMotors(0.08f, -0.08f, RIGHT);
+      break;
+    case MODE_RPM:
+      setMotors(700.0f, -700.0f, RIGHT);
+      break;
+    case MODE_CURRENT:
+      setMotors(1.5f, -1.5f, RIGHT);
+      break;
+  }
+}
+
+// ---------- telemetry ----------
+
+void readTelemetry() {
+  if (DRY_RUN) {
+    Serial.println("[DRY] Telemetry read skipped.");
+    return;
+  }
+
+  bool leftOk = leftVesc.getVescValues();
+  bool rightOk = rightVesc.getVescValues();
+
+  Serial.print("Left telemetry: ");
+  Serial.println(leftOk ? "OK" : "FAILED");
+  if (leftOk) {
+    Serial.print("  RPM: ");
+    Serial.println(leftVesc.data.rpm);
+    Serial.print("  Vin: ");
+    Serial.println(leftVesc.data.inpVoltage);
+  }
+
+  Serial.print("Right telemetry: ");
+  Serial.println(rightOk ? "OK" : "FAILED");
+  if (rightOk) {
+    Serial.print("  RPM: ");
+    Serial.println(rightVesc.data.rpm);
+    Serial.print("  Vin: ");
+    Serial.println(rightVesc.data.inpVoltage);
+  }
+}
+
+// ---------- drive state ----------
+
+void enableDrive() {
+  driveEnabled = true;
+  lastCmdMs = millis();
+  Serial.println("Drive ENABLED");
+  stopMotors();
+}
+
+void disableDrive() {
+  stopMotors();
+  driveEnabled = false;
+  Serial.println("Drive DISABLED");
+}
+
+// ---------- serial command handler ----------
+
+void handleCommand(char c) {
+  switch (c) {
+    case 'h':
+    case 'H':
+      printHelp();
+      break;
+
+    case 'e':
+    case 'E':
+      enableDrive();
+      break;
+
+    case 'd':
+    case 'D':
+      disableDrive();
+      break;
+
+    case 'f':
+    case 'F':
+      commandForward();
+      break;
+
+    case 'b':
+    case 'B':
+      commandReverse();
+      break;
+
+    case 'l':
+    case 'L':
+      commandLeft();
+      break;
+
+    case 'r':
+    case 'R':
+      commandRight();
+      break;
+
+    case 's':
+    case 'S':
+      stopMotors();
+      break;
+
+    case 'p':
+    case 'P':
+      printStatus();
+      break;
+
+    case '1':
+      controlMode = MODE_DUTY;
+      Serial.println("Control mode -> DUTY");
+      break;
+
+    case '2':
+      controlMode = MODE_RPM;
+      Serial.println("Control mode -> RPM");
+      break;
+
+    case '3':
+      controlMode = MODE_CURRENT;
+      Serial.println("Control mode -> CURRENT");
+      break;
+
+    case 't':
+    case 'T':
+      readTelemetry();
+      break;
+
+    case '\n':
+    case '\r':
+      break;
+
+    default:
+      Serial.print("Unknown command: ");
+      Serial.println(c);
+      break;
+  }
+}
+
+void setup() {
+  Serial.begin(115200);
+  while (!Serial) {;}
+
+  // UART to the VESCs
+  LEFT_VESC_SERIAL.begin(115200);
+  RIGHT_VESC_SERIAL.begin(115200);
+
+  leftVesc.setSerialPort(&LEFT_VESC_SERIAL);
+  rightVesc.setSerialPort(&RIGHT_VESC_SERIAL);
+
+  Serial.println();
+  Serial.println("Dummy Chair + VESC UART Skeleton started.");
+  printHelp();
+  printStatus();
+
+  stopMotors();
+}
+
+void loop() {
+  while (Serial.available() > 0) {
+    char c = Serial.read();
+    handleCommand(c);
+  }
+
+  // auto-stop on timeout
+  if (driveEnabled && (millis() - lastCmdMs > CMD_TIMEOUT_MS) && motion != STOPPED) {
+    Serial.println("Command timeout -> STOP");
+    stopMotors();
+  }
+
+  // keepalive for active connection
+  if (driveEnabled && (millis() - lastKeepAliveMs > KEEPALIVE_MS)) {
+    lastKeepAliveMs = millis();
+    sendKeepaliveBoth();
+  }
+}
