@@ -7,7 +7,7 @@ import argparse
 def find_hog(image):
     fd, hog_image = hog(
         image,
-        orientations=8,
+        orientations=9,
         pixels_per_cell=(16, 16),
         cells_per_block=(1, 1),
         visualize=True,
@@ -30,9 +30,9 @@ def visualize_hog(image, hog_image):
     ax2.set_title('Histogram of Oriented Gradients')
     plt.show()
 
+
 def hog_step(image):
     hog_image = find_hog(image)
-    print (hog_image.shape)
     visualize_hog(image, hog_image)
 
 
