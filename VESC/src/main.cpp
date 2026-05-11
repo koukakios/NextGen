@@ -39,7 +39,7 @@ static const uint32_t FDCAN2_MESSAGE_RAM_WORD_SIZE = 2560;
 
 // ====================== SAFETY SWITCH ======================
 
-constexpr bool DRY_RUN = true;   // true = safe print only, false = real CAN driving
+constexpr bool DRY_RUN = false;   // true = safe print only, false = real CAN driving
 
 // ====================== CAN SETUP ======================
 
