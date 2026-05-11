@@ -32,13 +32,9 @@ constexpr bool DRY_RUN = true;
 VescUart leftVesc;
 VescUart rightVesc;
 
-<<<<<<< HEAD
-constexpr bool DRY_RUN = false;   // true = safe print only, false = real CAN driving
-=======
 // --------------------------------------------------
 // Timing
 // --------------------------------------------------
->>>>>>> 798250642480161c586e4aef3528b49da125db28
 
 constexpr unsigned long EXPECTED_PC_COMMAND_PERIOD_MS = 50;
 constexpr unsigned long PC_TIMEOUT_MS = 500;

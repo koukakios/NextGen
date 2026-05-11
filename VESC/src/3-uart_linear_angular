@@ -1,0 +1,421 @@
+#include <Arduino.h>
+#include <VescUart.h>
+#include <math.h>
+#include <stdlib.h>
+#include <string.h>
+
+// --------------------------------------------------
+// Simple wheelchair controller
+// PC/headtracking -> Arduino over USB Serial
+// Arduino -> two VESCs over UART
+//
+// PC command format:
+//   VEL,enable,linear,angular,confidence
+//
+// Example:
+//   VEL,1,0.30,0.60,90
+//
+// linear  range: -1.0 to +1.0
+// angular range: -1.0 to +1.0
+//
+// angular > 0 = turn right
+// angular < 0 = turn left
+// --------------------------------------------------
+
+constexpr bool DRY_RUN = true;
+
+// USB Serial from computer
+#define COMMAND_SERIAL Serial
+
+// UARTs to VESCs
+#define LEFT_VESC_SERIAL  Serial1
+#define RIGHT_VESC_SERIAL Serial2
+
+VescUart leftVesc;
+VescUart rightVesc;
+
+// ---------------- Safety settings ----------------
+
+constexpr float MAX_RPM = 1000.0f;          // Start low
+constexpr float LINEAR_DEADBAND = 0.05f;
+constexpr float ANGULAR_DEADBAND = 0.05f;
+
+constexpr uint8_t MIN_CONFIDENCE = 50;
+constexpr unsigned long PC_TIMEOUT_MS = 500;
+constexpr unsigned long KEEPALIVE_MS = 100;
+
+bool driveEnabled = false;
+
+float leftRPM = 0.0f;
+float rightRPM = 0.0f;
+
+unsigned long lastPcCommandMs = 0;
+unsigned long lastKeepAliveMs = 0;
+bool pcCommandSeen = false;
+
+// UART line buffer
+char lineBuffer[100];
+uint8_t lineIndex = 0;
+
+// ---------------- Helper functions ----------------
+
+float clampFloat(float x, float minVal, float maxVal) {
+  if (x < minVal) return minVal;
+  if (x > maxVal) return maxVal;
+  return x;
+}
+
+float applyDeadband(float x, float deadband) {
+  if (fabsf(x) < deadband) {
+    return 0.0f;
+  }
+  return x;
+}
+
+uint8_t clampByte(int x, int minVal, int maxVal) {
+  if (x < minVal) x = minVal;
+  if (x > maxVal) x = maxVal;
+  return (uint8_t)x;
+}
+
+// ---------------- VESC commands ----------------
+
+void sendLeftRPM(float rpm) {
+  if (DRY_RUN) {
+    Serial.print("[DRY] LEFT RPM  -> ");
+    Serial.println(rpm, 1);
+    return;
+  }
+
+  leftVesc.setRPM(rpm);
+}
+
+void sendRightRPM(float rpm) {
+  if (DRY_RUN) {
+    Serial.print("[DRY] RIGHT RPM -> ");
+    Serial.println(rpm, 1);
+    return;
+  }
+
+  rightVesc.setRPM(rpm);
+}
+
+void sendBothRPM(float left, float right) {
+  leftRPM = left;
+  rightRPM = right;
+
+  sendLeftRPM(leftRPM);
+  sendRightRPM(rightRPM);
+}
+
+void stopMotors() {
+  sendBothRPM(0.0f, 0.0f);
+  Serial.println("Motors -> STOP");
+}
+
+void enableDrive() {
+  driveEnabled = true;
+  Serial.println("Drive ENABLED");
+  stopMotors();
+}
+
+void disableDrive() {
+  stopMotors();
+  driveEnabled = false;
+  Serial.println("Drive DISABLED");
+}
+
+void sendKeepaliveBoth() {
+  if (DRY_RUN) {
+    return;
+  }
+
+  leftVesc.sendKeepalive();
+  rightVesc.sendKeepalive();
+}
+
+// ---------------- Velocity control ----------------
+
+void applyVelocityCommand(float linear, float angular) {
+  if (!driveEnabled) {
+    Serial.println("Drive disabled. Command ignored.");
+    return;
+  }
+
+  // Clamp computer input
+  linear = clampFloat(linear, -1.0f, 1.0f);
+  angular = clampFloat(angular, -1.0f, 1.0f);
+
+  // Remove tiny headtracking noise
+  linear = applyDeadband(linear, LINEAR_DEADBAND);
+  angular = applyDeadband(angular, ANGULAR_DEADBAND);
+
+  // Differential drive mixing
+  // angular > 0 means turn right
+  float leftNorm  = linear + angular;
+  float rightNorm = linear - angular;
+
+  // Normalize so neither motor goes beyond -1.0 to +1.0
+  float maxMag = max(fabsf(leftNorm), fabsf(rightNorm));
+
+  if (maxMag > 1.0f) {
+    leftNorm /= maxMag;
+    rightNorm /= maxMag;
+  }
+
+  float newLeftRPM = leftNorm * MAX_RPM;
+  float newRightRPM = rightNorm * MAX_RPM;
+
+  sendBothRPM(newLeftRPM, newRightRPM);
+
+  Serial.print("VEL -> linear=");
+  Serial.print(linear, 3);
+  Serial.print(" angular=");
+  Serial.print(angular, 3);
+  Serial.print(" | leftRPM=");
+  Serial.print(newLeftRPM, 1);
+  Serial.print(" rightRPM=");
+  Serial.println(newRightRPM, 1);
+}
+
+void handleVelocityLine(char* line) {
+  // Expected:
+  // VEL,enable,linear,angular,confidence
+
+  char* token = strtok(line, ",");
+
+  if (token == nullptr) {
+    return;
+  }
+
+  if (strcmp(token, "VEL") != 0 && strcmp(token, "vel") != 0) {
+    Serial.print("Unknown command: ");
+    Serial.println(token);
+    Serial.println("Use: VEL,enable,linear,angular,confidence");
+    return;
+  }
+
+  char* enableStr = strtok(nullptr, ",");
+  char* linearStr = strtok(nullptr, ",");
+  char* angularStr = strtok(nullptr, ",");
+  char* confidenceStr = strtok(nullptr, ",");
+
+  if (
+    enableStr == nullptr ||
+    linearStr == nullptr ||
+    angularStr == nullptr ||
+    confidenceStr == nullptr
+  ) {
+    Serial.println("Invalid format. Use: VEL,enable,linear,angular,confidence");
+    return;
+  }
+
+  uint8_t enable = clampByte(atoi(enableStr), 0, 1);
+  float linear = atof(linearStr);
+  float angular = atof(angularStr);
+  uint8_t confidence = clampByte(atoi(confidenceStr), 0, 100);
+
+  lastPcCommandMs = millis();
+  pcCommandSeen = true;
+
+  Serial.print("Received: enable=");
+  Serial.print(enable);
+  Serial.print(" linear=");
+  Serial.print(linear, 3);
+  Serial.print(" angular=");
+  Serial.print(angular, 3);
+  Serial.print(" confidence=");
+  Serial.println(confidence);
+
+  if (confidence < MIN_CONFIDENCE) {
+    Serial.println("Confidence too low -> STOP");
+    stopMotors();
+    return;
+  }
+
+  if (enable == 0) {
+    disableDrive();
+    return;
+  }
+
+  if (!driveEnabled) {
+    enableDrive();
+  }
+
+  applyVelocityCommand(linear, angular);
+}
+
+// ---------------- Serial input ----------------
+
+void printStatus() {
+  Serial.println();
+  Serial.println("========== STATUS ==========");
+  Serial.print("DRY_RUN: ");
+  Serial.println(DRY_RUN ? "true" : "false");
+
+  Serial.print("Drive enabled: ");
+  Serial.println(driveEnabled ? "YES" : "NO");
+
+  Serial.print("MAX_RPM: ");
+  Serial.println(MAX_RPM, 1);
+
+  Serial.print("Left RPM: ");
+  Serial.println(leftRPM, 1);
+
+  Serial.print("Right RPM: ");
+  Serial.println(rightRPM, 1);
+
+  Serial.print("PC command seen: ");
+  Serial.println(pcCommandSeen ? "YES" : "NO");
+  Serial.println("============================");
+  Serial.println();
+}
+
+void printHelp() {
+  Serial.println();
+  Serial.println("=== RPM Wheelchair UART Controller ===");
+  Serial.println("Computer command:");
+  Serial.println("  VEL,enable,linear,angular,confidence");
+  Serial.println();
+  Serial.println("Examples:");
+  Serial.println("  VEL,1,0.30,0.00,90   forward");
+  Serial.println("  VEL,1,0.00,0.50,90   turn right");
+  Serial.println("  VEL,1,0.00,-0.50,90  turn left");
+  Serial.println("  VEL,1,0.00,0.00,90   stop");
+  Serial.println("  VEL,0,0.00,0.00,90   disable");
+  Serial.println();
+  Serial.println("Manual commands:");
+  Serial.println("  h = help");
+  Serial.println("  p = status");
+  Serial.println("  s = stop");
+  Serial.println("  e = enable");
+  Serial.println("  d = disable");
+  Serial.println("======================================");
+  Serial.println();
+}
+
+void handleManualChar(char c) {
+  switch (c) {
+    case 'h':
+    case 'H':
+      printHelp();
+      break;
+
+    case 'p':
+    case 'P':
+      printStatus();
+      break;
+
+    case 's':
+    case 'S':
+      stopMotors();
+      break;
+
+    case 'e':
+    case 'E':
+      enableDrive();
+      break;
+
+    case 'd':
+    case 'D':
+      disableDrive();
+      break;
+
+    default:
+      break;
+  }
+}
+
+bool isManualChar(char c) {
+  return (
+    c == 'h' || c == 'H' ||
+    c == 'p' || c == 'P' ||
+    c == 's' || c == 'S' ||
+    c == 'e' || c == 'E' ||
+    c == 'd' || c == 'D'
+  );
+}
+
+void processComputerSerial() {
+  while (COMMAND_SERIAL.available() > 0) {
+    char c = COMMAND_SERIAL.read();
+
+    // Allow manual single-character commands
+    if (lineIndex == 0 && isManualChar(c)) {
+      handleManualChar(c);
+      continue;
+    }
+
+    if (c == '\r') {
+      continue;
+    }
+
+    if (c == '\n') {
+      lineBuffer[lineIndex] = '\0';
+
+      if (lineIndex > 0) {
+        handleVelocityLine(lineBuffer);
+      }
+
+      lineIndex = 0;
+      continue;
+    }
+
+    if (lineIndex < sizeof(lineBuffer) - 1) {
+      lineBuffer[lineIndex++] = c;
+    } else {
+      lineIndex = 0;
+      Serial.println("Line too long. Discarded.");
+    }
+  }
+}
+
+void processPcTimeout() {
+  if (!pcCommandSeen) {
+    return;
+  }
+
+  if (driveEnabled && millis() - lastPcCommandMs > PC_TIMEOUT_MS) {
+    Serial.println("PC command timeout -> STOP");
+    stopMotors();
+    pcCommandSeen = false;
+  }
+}
+
+// ---------------- Setup and loop ----------------
+
+void setup() {
+  Serial.begin(115200);
+
+  while (!Serial) {
+    delay(10);
+  }
+
+  LEFT_VESC_SERIAL.begin(115200);
+  RIGHT_VESC_SERIAL.begin(115200);
+
+  leftVesc.setSerialPort(&LEFT_VESC_SERIAL);
+  rightVesc.setSerialPort(&RIGHT_VESC_SERIAL);
+
+  Serial.println();
+  Serial.println("RPM-only wheelchair UART controller started.");
+  Serial.println("Input: PC velocity over USB Serial.");
+  Serial.println("Output: RPM commands to two VESCs over UART.");
+  Serial.println();
+
+  printHelp();
+  printStatus();
+
+  stopMotors();
+}
+
+void loop() {
+  processComputerSerial();
+
+  processPcTimeout();
+
+  if (driveEnabled && millis() - lastKeepAliveMs > KEEPALIVE_MS) {
+    lastKeepAliveMs = millis();
+    sendKeepaliveBoth();
+  }
+}
