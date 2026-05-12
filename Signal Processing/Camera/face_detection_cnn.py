@@ -21,6 +21,9 @@ class FaceDirectionDetector:
         # Αρχικοποίηση κάμερας
         self.cap = cv2.VideoCapture(camera_index)
 
+        #State
+        self.state = 'm'
+
     def get_direction(self, startX, endX, nose_x):
         """
         Υπολογίζει αν το πρόσωπο κοιτάει αριστερά, δεξιά ή κέντρο.
@@ -31,10 +34,13 @@ class FaceDirectionDetector:
         margin = face_width * self.deadzone_ratio
 
         if nose_x < (face_center_x - margin):
+            self.state = 'l'
             return "LEFT", (255, 0, 0)  # Μπλε
         elif nose_x > (face_center_x + margin):
+            self.state = 'r'
             return "RIGHT", (0, 0, 255)  # Κόκκινο
         else:
+            self.state = 'm'
             return "MIDDLE", (0, 255, 0)  # Πράσινο
 
     def run(self):
