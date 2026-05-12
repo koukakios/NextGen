@@ -73,9 +73,13 @@ static const uint32_t FDCAN2_MESSAGE_RAM_WORD_SIZE = 0;
 
 bool canReady = false;
 
+<<<<<<< HEAD
+constexpr bool DRY_RUN = false;   // true = safe print only, false = real CAN driving
+=======
 // --------------------------------------------------
 // Timing
 // --------------------------------------------------
+>>>>>>> 798250642480161c586e4aef3528b49da125db28
 
 constexpr unsigned long EXPECTED_PC_COMMAND_PERIOD_MS = 50;
 constexpr unsigned long PC_TIMEOUT_MS = 500;
