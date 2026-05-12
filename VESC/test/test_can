@@ -1,0 +1,300 @@
+import argparse
+from html import parser
+import sys
+import time
+import threading
+import serial
+
+
+BAUD = 115200
+MOVE_PERIOD_S = 0.05
+
+
+class DryRunTester:
+    def __init__(self, port, baud):
+        self.ser = serial.Serial(port, baudrate=baud, timeout=0.1)
+        self.running = True
+        self.rx_lines = []
+        self.lock = threading.Lock()
+        self.reader = threading.Thread(target=self.reader_loop, daemon=True)
+
+    def start(self):
+        print(f"[INFO] Connected to {self.ser.port} at {self.ser.baudrate}")
+        self.reader.start()
+        time.sleep(2.0)
+
+    def close(self):
+        self.running = False
+        time.sleep(0.2)
+        if self.ser.is_open:
+            self.ser.close()
+        print("[INFO] Closed serial port")
+
+    def reader_loop(self):
+        buf = ""
+
+        while self.running:
+            try:
+                data = self.ser.read(self.ser.in_waiting or 1)
+
+                if not data:
+                    continue
+
+                text = data.decode(errors="replace")
+                buf += text
+
+                while "\n" in buf:
+                    line, buf = buf.split("\n", 1)
+                    line = line.strip()
+
+                    if line:
+                        print(f"RX: {line}")
+                        with self.lock:
+                            self.rx_lines.append(line)
+
+            except Exception as e:
+                print(f"[READER ERROR] {e}")
+                break
+
+    def send(self, payload):
+        frame = f"<{payload}>"
+        print(f"TX: {frame}")
+        self.ser.write(frame.encode("ascii"))
+        self.ser.flush()
+
+    def wait(self, seconds):
+        time.sleep(seconds)
+
+    def clear_rx(self):
+        with self.lock:
+            self.rx_lines.clear()
+
+    def recent_rx_text(self):
+        with self.lock:
+            return "\n".join(self.rx_lines[-50:])
+
+    def expect_contains(self, text, timeout=2.0):
+        start = time.monotonic()
+
+        while time.monotonic() - start < timeout:
+            if text in self.recent_rx_text():
+                print(f"[PASS] Saw expected text: {text}")
+                return True
+            time.sleep(0.05)
+
+        print(f"[FAIL] Did not see expected text: {text}")
+        return False
+
+    def status(self):
+        self.send("STATUS")
+        self.wait(0.3)
+
+    def tel(self):
+        self.send("TEL")
+        self.wait(0.3)
+
+    def enable(self):
+        self.send("EN,1")
+        self.wait(0.3)
+
+    def disable(self):
+        self.send("EN,0")
+        self.wait(0.3)
+
+    def mode(self, value):
+        self.send(f"MODE,{value}")
+        self.wait(0.3)
+
+    def move_once(self, cmd):
+        self.send(f"MOVE,{cmd}")
+
+    def hold_move(self, cmd, seconds):
+        print(f"[TEST] Hold MOVE,{cmd} for {seconds:.2f}s")
+        start = time.monotonic()
+
+        while time.monotonic() - start < seconds:
+            self.move_once(cmd)
+            time.sleep(MOVE_PERIOD_S)
+
+    def verify_dry_run(self):
+        print("\n=== Verify Arduino is in DRY_RUN mode ===")
+        self.clear_rx()
+        self.status()
+
+        text = self.recent_rx_text()
+
+        if "DRY=1" not in text:
+            print()
+            print("[SAFETY STOP] Arduino did not report DRY=1.")
+            print("Set this in the Arduino code:")
+            print("  constexpr bool DRY_RUN = true;")
+            print()
+            return False
+
+        print("[PASS] Arduino reports DRY=1")
+        return True
+
+    def test_invalid_commands(self):
+        print("\n=== Invalid command test ===")
+
+        commands = [
+            "MOVE,F",
+            "MODE,2",
+            "EN",
+            "EN,7",
+            "MODE",
+            "MODE,99",
+            "MOVE",
+            "MOVE,X",
+            "HELLO",
+        ]
+
+        for cmd in commands:
+            self.send(cmd)
+            self.wait(0.25)
+
+        self.status()
+
+    def test_enable_mode_motion(self):
+        print("\n=== Enable / mode / movement dry-run test ===")
+
+        self.clear_rx()
+
+        self.enable()
+        self.expect_contains("ACK,EN,1")
+        self.expect_contains("WAITING_FOR_MODE")
+
+        self.mode(2)
+        self.expect_contains("ACK,MODE,2KMH")
+
+        self.status()
+
+        self.hold_move("F", 0.5)
+        self.expect_contains("ACK,MOVE,F")
+
+        self.hold_move("S", 0.3)
+        self.expect_contains("ACK,MOVE,S")
+
+        self.hold_move("B", 0.5)
+        self.expect_contains("ACK,MOVE,B")
+
+        self.hold_move("S", 0.3)
+
+        self.hold_move("L", 0.5)
+        self.expect_contains("ACK,MOVE,L")
+
+        self.hold_move("S", 0.3)
+
+        self.hold_move("R", 0.5)
+        self.expect_contains("ACK,MOVE,R")
+
+        self.hold_move("S", 0.5)
+
+        self.tel()
+        self.status()
+
+        self.disable()
+        self.expect_contains("ACK,EN,0")
+
+        self.status()
+
+    def test_direction_transition(self):
+        print("\n=== Direction transition test ===")
+
+        self.enable()
+        self.mode(2)
+
+        self.hold_move("F", 0.4)
+
+        print("[TEST] Switch directly from forward to reverse")
+        self.hold_move("B", 0.5)
+
+        self.expect_contains("MOTION_CHANGE")
+        self.expect_contains("MOTORS_STOPPED")
+
+        self.hold_move("S", 0.3)
+        self.disable()
+
+    def test_timeout(self):
+        print("\n=== Timeout test ===")
+
+        self.clear_rx()
+
+        self.enable()
+        self.mode(2)
+
+        self.hold_move("F", 0.3)
+
+        print("[TEST] Stop sending commands. Arduino should timeout after 500 ms.")
+        time.sleep(1.0)
+
+        self.expect_contains("PC_TIMEOUT_500MS")
+        self.expect_contains("DRIVE_DISABLED_AFTER_TIMEOUT")
+
+        self.status()
+
+        print("[TEST] Try MOVE after timeout. Should require EN,1 again.")
+        self.send("MOVE,F")
+        self.wait(0.3)
+
+        self.expect_contains("TIMEOUT_SEND_EN_FIRST")
+
+        print("[TEST] Re-enable after timeout")
+        self.enable()
+        self.mode(2)
+        self.hold_move("S", 0.3)
+        self.disable()
+
+    def run_all(self):
+        if not self.verify_dry_run():
+            return False
+
+        self.test_invalid_commands()
+        self.test_enable_mode_motion()
+        self.test_direction_transition()
+        self.test_timeout()
+
+        print("\n=== Final status ===")
+        self.status()
+
+        print("\n[DONE] Dry-run test complete")
+        return True
+
+
+def main():
+    parser = argparse.ArgumentParser()
+    Sparser.add_argument("--port", default="COM9", help="Serial port, default is COM9")
+    parser.add_argument("--baud", type=int, default=BAUD)
+    args = parser.parse_args()
+
+    print("======================================")
+    print("Arduino GIGA VESC CAN dry-run tester")
+    print("======================================")
+    print("This script expects Arduino DRY_RUN = true.")
+    print("It will refuse to continue unless <STATUS> reports DRY=1.")
+    print()
+
+    tester = DryRunTester(args.port, args.baud)
+
+    try:
+        tester.start()
+        ok = tester.run_all()
+
+        if not ok:
+            sys.exit(1)
+
+    except KeyboardInterrupt:
+        print("\n[CTRL-C] Sending emergency stop/disable")
+        try:
+            tester.send("MOVE,S")
+            time.sleep(0.1)
+            tester.send("EN,0")
+        except Exception:
+            pass
+
+    finally:
+        tester.close()
+
+
+if __name__ == "__main__":
+    main()

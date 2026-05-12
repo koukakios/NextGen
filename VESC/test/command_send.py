@@ -45,7 +45,7 @@ read_replies()
 # <MODE,2>
 # <MODE,5>
 # <MODE,10>
-send_frame("<MODE,2>")
+send_frame("<MODE,10>")
 time.sleep(0.05)
 read_replies()
 

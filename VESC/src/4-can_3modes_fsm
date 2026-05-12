@@ -326,14 +326,6 @@ void pcWarn(const char* message) {
 // --------------------------------------------------
 
 void setMotorRelay(bool active) {
-  if (DRY_RUN) {
-    motorRelayActive = false;
-    PC_SERIAL.print("<DRY,MOTOR_RELAY_REQUEST=");
-    PC_SERIAL.print(active ? 1 : 0);
-    PC_SERIAL.println(">");
-    return;
-  }
-
   digitalWrite(MOTOR_RELAY_PIN, active ? MOTOR_RELAY_ACTIVE_LEVEL : MOTOR_RELAY_INACTIVE_LEVEL);
   motorRelayActive = active;
 
