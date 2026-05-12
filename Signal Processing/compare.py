@@ -5,7 +5,7 @@ import matplotlib.pyplot as plt
 import time
 
 # Import your fixed Mic class
-from Mic_processing import Mic
+from mic_class import Mic
 
 
 def get_spectrogram(audio, fs=16_000):

@@ -1,7 +1,7 @@
 from keras.src.saving import load_model
-import Mic_processing
+import mic_class
 import plotting
-import EMG_process
+import emg_class
 # my_mic = Mic_processing.Mic(data = 0, fs = 16_000, port ='/dev/cu.usbmodem101', baud = 1_000_000, samples=32_000)
 # my_mic.model = load_model('model1.keras')
 #
