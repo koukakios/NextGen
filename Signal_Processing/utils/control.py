@@ -9,6 +9,12 @@ from classes.mic_class import Mic
 from utils.collect_data import get_latest_data
 from utils.signal_to_motor import signal_to_motor
 
+
+#Camera imports
+from classes.camera_class import Camera
+from utils.Config import DNN_PROTO, DNN_MODEL, LBF_MODEL
+from utils.Config import deadzone_ratio, cam_index
+
 PORT = '/dev/cu.usbmodem101'
 BAUD = 1_000_000
 
@@ -22,7 +28,15 @@ if __name__ == "__main__":
     my_mic = Mic(fs=16_000, samples=16_000)
     print("Loading AI Model...")
     my_mic.model = load_model('model1.keras')
-    #my_cam = Cam()
+
+    #initialize camera
+    my_cam = Camera(
+        proto_path=DNN_PROTO,
+        model_path=DNN_MODEL,
+        landmark_path=LBF_MODEL,
+        camera_index=cam_index,
+        deadzone_ratio=deadzone_ratio
+    )
 
     print(f"Connecting to Arduino on {PORT}...")
 
@@ -40,6 +54,10 @@ if __name__ == "__main__":
 
                 if my_mic.mic_state:
                     my_emg.update_mode(latest_emg)
+
+                #get camera direction
+                my_cam.update_state()
+                direction = my_cam.state
 
                 #sending to uart:
                 uart = 0b000

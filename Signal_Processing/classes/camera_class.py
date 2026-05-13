@@ -1,8 +1,9 @@
 import cv2
 import numpy as np
+from utils.Config import DNN_PROTO, DNN_MODEL, LBF_MODEL
+from utils.Config import deadzone_ratio, cam_index
 
-
-class FaceDirectionDetector:
+class Camera:
     def __init__(self, proto_path, model_path, landmark_path, camera_index=0, deadzone_ratio=0.06):
         """
         Αρχικοποίηση της κλάσης με τα μοντέλα και την κάμερα.
@@ -34,13 +35,13 @@ class FaceDirectionDetector:
         margin = face_width * self.deadzone_ratio
 
         if nose_x < (face_center_x - margin):
-            self.state = 'l'
+            self.state = "LEFT"
             return "LEFT", (255, 0, 0)  # Μπλε
         elif nose_x > (face_center_x + margin):
-            self.state = 'r'
+            self.state = "RIGHT"
             return "RIGHT", (0, 0, 255)  # Κόκκινο
         else:
-            self.state = 'm'
+            self.state = "MIDDLE"
             return "MIDDLE", (0, 255, 0)  # Πράσινο
 
     def update_state(self):
@@ -112,19 +113,14 @@ class FaceDirectionDetector:
 
 # --- ΕΚΤΕΛΕΣΗ ΚΩΔΙΚΑ ---
 if __name__ == "__main__":
-    # Τα δικά σου Paths
-    DNN_PROTO = r"C:\Users\kkouk\Downloads\deploy.prototxt.txt"
-    DNN_MODEL = r"C:\Users\kkouk\Downloads\res10_300x300_ssd_iter_140000.caffemodel"
-    LBF_MODEL = r"C:\Users\kkouk\Downloads\lbfmodel.yaml"
-
     # Δημιουργία του αντικειμένου και εκκίνηση
     # Μπορείς να αλλάξεις το 0.06 εδώ απευθείας:
-    detector = FaceDirectionDetector(
+    detector = Camera(
         proto_path=DNN_PROTO,
         model_path=DNN_MODEL,
         landmark_path=LBF_MODEL,
-        camera_index=0,
-        deadzone_ratio=0.06
+        camera_index=cam_index,
+        deadzone_ratio=deadzone_ratio
     )
 
     detector.update_state()
