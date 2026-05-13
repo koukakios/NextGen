@@ -108,9 +108,9 @@ from pynput import keyboard
 # from wheelchair_comm import WheelchairController 
 
 # --- Configuration ---
-PORT = 'COM3'
-V_MAX = 0.5  # Maximum linear velocity (m/s)
-W_MAX = 0.5  # Maximum angular velocity (rad/s)
+PORT = 'COM5'
+V_MAX = 1.0  # Maximum linear velocity (m/s)
+W_MAX = 1.0  # Maximum angular velocity (rad/s)
 
 # State dictionary to track which keys are currently held down
 active_keys = {
