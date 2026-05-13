@@ -6,9 +6,14 @@ from tensorflow.keras.models import load_model
 # Clean Absolute Imports
 from classes.emg_class import EMG
 from classes.mic_class import Mic
-from classes.face_detection_cnn import FaceDirectionDetector
 from utils.collect_data import get_latest_data
 from utils.signal_to_motor import signal_to_motor
+
+
+#Camera imports
+from classes.camera_class import Camera
+from utils.Config import DNN_PROTO, DNN_MODEL, LBF_MODEL
+from utils.Config import deadzone_ratio, cam_index
 
 PORT = '/dev/cu.usbmodem101'
 BAUD = 1_000_000
@@ -23,16 +28,20 @@ if __name__ == "__main__":
     my_mic = Mic(fs=16_000, samples=16_000)
     print("Loading AI Model...")
     my_mic.model = load_model('model1.keras')
-    
-    # Initialize Cam 
-    my_cam = FaceDirectionDetector()
+
+    #initialize camera
+    my_cam = Camera(
+        proto_path=DNN_PROTO,
+        model_path=DNN_MODEL,
+        landmark_path=LBF_MODEL,
+        camera_index=cam_index,
+        deadzone_ratio=deadzone_ratio
+    )
 
     print(f"Connecting to Arduino on {PORT}...")
-    uart = 0b000
-    last_sent_time = time.time()
-    last_sent_uart = None
+
     try:
-        with serial.Serial(PORT, BAUD, timeout = 0.1) as ser:
+        with serial.Serial(PORT, BAUD, timeout=0) as ser:
             ser.reset_input_buffer()
             time.sleep(2)  # Give Arduino time to reset
 
@@ -46,16 +55,14 @@ if __name__ == "__main__":
                 if my_mic.mic_state:
                     my_emg.update_mode(latest_emg)
 
+                #get camera direction
+                my_cam.update_state()
+                direction = my_cam.state
+
                 #sending to uart:
-                turning_mode = False #should be changed to some input from the user
+                uart = 0b000
+                turning_mode = False
                 uart = signal_to_motor(my_mic.mic_state, my_emg.mode, my_cam.turn_dir, turning_mode, uart)
-                current_time = time.time()
-                # Send if 100ms passed OR if the command actually changed
-                if (current_time - last_sent_time >= 0.1) or (uart != last_sent_uart):
-                    ser.write(uart.to_bytes(1, 'big'))
-                    last_sent_time = current_time
-                    last_sent_uart = uart
-                
                 # 4. Optional UI Update for the console (keeping it clean)
                 if latest_emg and not my_emg.is_collecting:
                     print(f"EMG Gear: {my_emg.mode} | Mic State: {my_mic.mic_state}      ", end='\r')
