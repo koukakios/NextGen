@@ -57,12 +57,11 @@ if __name__ == "__main__":
 
                 #get camera direction
                 my_cam.update_state()
-                direction = my_cam.state
 
                 #sending to uart:
                 uart = 0b000
                 turning_mode = False
-                uart = signal_to_motor(my_mic.mic_state, my_emg.mode, my_cam.turn_dir, turning_mode, uart)
+                uart = signal_to_motor(my_mic.mic_state, my_emg.mode, my_cam.state, turning_mode, uart)
                 # 4. Optional UI Update for the console (keeping it clean)
                 if latest_emg and not my_emg.is_collecting:
                     print(f"EMG Gear: {my_emg.mode} | Mic State: {my_mic.mic_state}      ", end='\r')

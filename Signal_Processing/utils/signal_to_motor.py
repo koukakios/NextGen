@@ -32,11 +32,11 @@ def signal_to_motor(mic_state, emg_mode, turn_dir, turning_mode = False, uart_ol
         elif emg_mode == (1,0,0): #mode 3
             uart = 0b011
 
-        if turn_dir == -1 and turning_mode == True: #turn left
+        if turn_dir == "LEFT" and turning_mode == True: #turn left
             uart = 0b101
-        elif turn_dir == 0: #still
+        elif turn_dir == "MIDDLE": #still
             uart = 0b000
-        elif turn_dir == 1 and turning_mode == True: #turn right
+        elif turn_dir == "RIGHT" and turning_mode == True: #turn right
             uart = 0b100
         return uart
 
