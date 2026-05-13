@@ -1,3 +1,5 @@
+import serial
+import struct
 mic_state = False
 
 def signal_mic_change(mic_word):
@@ -40,6 +42,10 @@ def signal_to_motor(mic_state, emg_mode, turn_dir, turning_mode = False, uart_ol
 
     else: return uart_old
 
+def send_data(port, data):
+    ser = serial.Serial(port, 1_000_000, timeout=0)
+    data += "\r\n"
+    ser.write(data.encode())
 
 
 
