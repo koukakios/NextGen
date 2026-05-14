@@ -32,7 +32,7 @@ class Mic:
             max_volume = np.max(np.abs(data_array))
 
             # If the volume is lower than 10% of the max mic capability, it's just room noise
-            if max_volume < 0.10:
+            if max_volume < 0.50:
                 # Uncomment the print statement below to tune your threshold!
                 # print(f"Quiet... (Volume: {max_volume:.3f})")
                 return  # Skip the AI entirely
