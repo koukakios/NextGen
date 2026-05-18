@@ -182,9 +182,9 @@ MotionState pendingMotion = STOPPED;
 // These are intentionally lower than your UART wheelchair code.
 // After confirming CAN direction and safety, increase carefully.
 
-constexpr float DUTY_MODE_1 = 0.30f;
-constexpr float DUTY_MODE_2 = 0.40f;
-constexpr float DUTY_MODE_3 = 0.50f;
+constexpr float DUTY_MODE_1 = 0.05f;
+constexpr float DUTY_MODE_2 = 0.08f;
+constexpr float DUTY_MODE_3 = 0.10f;
 
 constexpr float TURN_DUTY_FACTOR = 0.80f;
 constexpr float REVERSE_DUTY_FACTOR = 0.70f;

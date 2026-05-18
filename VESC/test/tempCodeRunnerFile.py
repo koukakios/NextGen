@@ -1,14 +1,17 @@
 import argparse
 import queue
+import re
 import threading
 import time
 import tkinter as tk
-from tkinter import scrolledtext
+from tkinter import scrolledtext, messagebox
+
 import serial
 
 
 BAUD = 115200
 SEND_PERIOD_MS = 50
+AUTO_STATUS_PERIOD_MS = 1000
 
 CMD_STOP = 0x00
 CMD_MODE1_FORWARD = 0x01
@@ -20,51 +23,7 @@ CMD_STATUS = 0x06
 CMD_ESTOP = 0x07
 
 
-COMMAND_INFO = {
-    CMD_STOP: {
-        "name": "STOP",
-        "key": "Space",
-        "meaning": "Zero duty to both VESCs, disables drive, turns A1 relay OFF."
-    },
-    CMD_MODE1_FORWARD: {
-        "name": "MODE1_FORWARD",
-        "key": "Hold 1",
-        "meaning": "Enables drive, turns A1 relay ON, drives both motors forward at mode 1 test duty."
-    },
-    CMD_MODE2_FORWARD: {
-        "name": "MODE2_FORWARD",
-        "key": "Hold 2",
-        "meaning": "Enables drive, turns A1 relay ON, drives both motors forward at mode 2 test duty."
-    },
-    CMD_MODE3_FORWARD: {
-        "name": "MODE3_FORWARD",
-        "key": "Hold 3",
-        "meaning": "Enables drive, turns A1 relay ON, drives both motors forward at mode 3 test duty."
-    },
-    CMD_RIGHT: {
-        "name": "RIGHT",
-        "key": "Hold D",
-        "meaning": "Enables drive, turns A1 relay ON, commands left motor forward and right motor reverse."
-    },
-    CMD_LEFT: {
-        "name": "LEFT",
-        "key": "Hold A",
-        "meaning": "Enables drive, turns A1 relay ON, commands left motor reverse and right motor forward."
-    },
-    CMD_STATUS: {
-        "name": "STATUS",
-        "key": "S",
-        "meaning": "Requests Arduino status. Does not move motors and does not change relay state."
-    },
-    CMD_ESTOP: {
-        "name": "ESTOP",
-        "key": "E",
-        "meaning": "Emergency stop: zero duty, disables drive, turns A1 relay OFF, latches ESTOP."
-    },
-}
-
-
-class CanRawByteHoldTester:
+class CanHoldButtonTester:
     def __init__(self, root, port, baud):
         self.root = root
         self.port = port
@@ -78,7 +37,24 @@ class CanRawByteHoldTester:
 
         self.rx_queue = queue.Queue()
 
-        self.root.title("CAN Raw-Byte Hold-Button VESC Test")
+        self.auto_status_var = tk.BooleanVar(value=True)
+
+        self.stat_text_vars = {
+            "connection": tk.StringVar(value="Connected"),
+            "drive": tk.StringVar(value="Drive: ?"),
+            "mode": tk.StringVar(value="Mode: ?"),
+            "motion": tk.StringVar(value="Motion: ?"),
+            "left": tk.StringVar(value="Left target: ?"),
+            "right": tk.StringVar(value="Right target: ?"),
+            "relay": tk.StringVar(value="Relay: ?"),
+            "timeout": tk.StringVar(value="Timeout: ?"),
+            "estop": tk.StringVar(value="E-stop: ?"),
+            "can": tk.StringVar(value="CAN: ?"),
+            "left_tel": tk.StringVar(value="Left VESC: ?"),
+            "right_tel": tk.StringVar(value="Right VESC: ?"),
+        }
+
+        self.root.title("CAN Binary Hold-Button VESC Test")
 
         self.build_ui()
 
@@ -87,98 +63,96 @@ class CanRawByteHoldTester:
 
         self.root.after(100, self.process_rx_queue)
         self.root.after(SEND_PERIOD_MS, self.send_active_command_loop)
+        self.root.after(AUTO_STATUS_PERIOD_MS, self.auto_status_loop)
 
         self.root.protocol("WM_DELETE_WINDOW", self.on_close)
 
         self.log(f"[INFO] Connected to {self.port} at {self.baud}")
-        self.log("[INFO] This is for the CAN raw-byte Arduino test main.cpp.")
+        self.log("[INFO] PC -> Arduino is USB Serial raw bytes.")
+        self.log("[INFO] Arduino -> VESC is CAN bus.")
         self.log("[INFO] Hold a movement button to send command every 50 ms.")
-        self.log("[INFO] Releasing a movement button sends STOP.")
+        self.log("[INFO] Releasing a movement button sends STOP burst.")
         self.log("[INFO] This sends RAW BYTES, not strings.")
-        self.log("[SAFETY] Test with wheels lifted.")
         self.log("")
 
-        self.log_command_map()
         self.send_byte(CMD_STATUS, "STATUS")
 
     def build_ui(self):
         top = tk.Frame(self.root)
-        top.pack(padx=10, pady=10)
+        top.pack(padx=10, pady=10, fill="x")
 
         status_button = tk.Button(
             top,
             text="STATUS\n0x06",
             width=18,
             height=2,
-            command=lambda: self.send_byte(CMD_STATUS, "STATUS")
+            command=lambda: self.send_byte(CMD_STATUS, "STATUS"),
         )
         status_button.grid(row=0, column=0, padx=5, pady=5)
 
         stop_button = tk.Button(
             top,
-            text="STOP\n0x00\nRelay OFF",
+            text="STOP\n0x00",
             width=18,
             height=2,
             bg="orange",
-            command=self.stop_now
+            command=self.stop_now,
         )
         stop_button.grid(row=0, column=1, padx=5, pady=5)
 
         estop_button = tk.Button(
             top,
-            text="ESTOP\n0x07\nRelay OFF",
+            text="ESTOP\n0x07",
             width=18,
             height=2,
             bg="red",
             fg="white",
-            command=self.estop_now
+            command=self.estop_now,
         )
         estop_button.grid(row=0, column=2, padx=5, pady=5)
 
-        command_map_button = tk.Button(
+        auto_status_check = tk.Checkbutton(
             top,
-            text="SHOW COMMAND MAP",
-            width=20,
-            height=2,
-            command=self.log_command_map
+            text="Auto status every 1 s",
+            variable=self.auto_status_var,
         )
-        command_map_button.grid(row=0, column=3, padx=5, pady=5)
+        auto_status_check.grid(row=0, column=3, padx=10, pady=5)
 
         movement_frame = tk.LabelFrame(
             self.root,
-            text="Hold button to move. Release sends STOP."
+            text="Hold button to move. Release sends STOP.",
         )
         movement_frame.pack(padx=10, pady=10)
 
         self.mode1_button = tk.Button(
             movement_frame,
-            text="HOLD MODE 1 FORWARD\n0x01\nRelay ON while held",
-            width=26,
-            height=4
+            text="HOLD MODE 1 FORWARD\n0x01",
+            width=24,
+            height=4,
         )
         self.mode2_button = tk.Button(
             movement_frame,
-            text="HOLD MODE 2 FORWARD\n0x02\nRelay ON while held",
-            width=26,
-            height=4
+            text="HOLD MODE 2 FORWARD\n0x02",
+            width=24,
+            height=4,
         )
         self.mode3_button = tk.Button(
             movement_frame,
-            text="HOLD MODE 3 FORWARD\n0x03\nRelay ON while held",
-            width=26,
-            height=4
+            text="HOLD MODE 3 FORWARD\n0x03",
+            width=24,
+            height=4,
         )
         self.right_button = tk.Button(
             movement_frame,
-            text="HOLD RIGHT\n0x04\nL forward / R reverse",
-            width=26,
-            height=4
+            text="HOLD RIGHT\n0x04",
+            width=24,
+            height=4,
         )
         self.left_button = tk.Button(
             movement_frame,
-            text="HOLD LEFT\n0x05\nL reverse / R forward",
-            width=26,
-            height=4
+            text="HOLD LEFT\n0x05",
+            width=24,
+            height=4,
         )
 
         self.mode1_button.grid(row=0, column=1, padx=6, pady=6)
@@ -193,41 +167,31 @@ class CanRawByteHoldTester:
         self.bind_hold_button(self.right_button, CMD_RIGHT, "RIGHT")
         self.bind_hold_button(self.left_button, CMD_LEFT, "LEFT")
 
-        legend_frame = tk.LabelFrame(self.root, text="Raw byte command map")
-        legend_frame.pack(padx=10, pady=5, fill="x")
+        status_frame = tk.LabelFrame(self.root, text="Decoded Arduino / CAN status")
+        status_frame.pack(padx=10, pady=5, fill="x")
 
-        headers = ["Byte", "Command", "Key/Button", "Meaning"]
-        for col, text in enumerate(headers):
-            label = tk.Label(legend_frame, text=text, font=("TkDefaultFont", 9, "bold"), anchor="w")
-            label.grid(row=0, column=col, sticky="w", padx=5, pady=3)
+        labels = [
+            "connection",
+            "drive",
+            "mode",
+            "motion",
+            "left",
+            "right",
+            "relay",
+            "timeout",
+            "estop",
+            "can",
+            "left_tel",
+            "right_tel",
+        ]
 
-        for row, cmd in enumerate(
-            [
-                CMD_STOP,
-                CMD_MODE1_FORWARD,
-                CMD_MODE2_FORWARD,
-                CMD_MODE3_FORWARD,
-                CMD_RIGHT,
-                CMD_LEFT,
-                CMD_STATUS,
-                CMD_ESTOP,
-            ],
-            start=1
-        ):
-            info = COMMAND_INFO[cmd]
-
-            tk.Label(legend_frame, text=f"0x{cmd:02X}", anchor="w").grid(
-                row=row, column=0, sticky="w", padx=5, pady=2
-            )
-            tk.Label(legend_frame, text=info["name"], anchor="w").grid(
-                row=row, column=1, sticky="w", padx=5, pady=2
-            )
-            tk.Label(legend_frame, text=info["key"], anchor="w").grid(
-                row=row, column=2, sticky="w", padx=5, pady=2
-            )
-            tk.Label(legend_frame, text=info["meaning"], anchor="w", wraplength=650, justify="left").grid(
-                row=row, column=3, sticky="w", padx=5, pady=2
-            )
+        for index, key in enumerate(labels):
+            tk.Label(
+                status_frame,
+                textvariable=self.stat_text_vars[key],
+                anchor="w",
+                width=42,
+            ).grid(row=index // 2, column=index % 2, sticky="w", padx=8, pady=2)
 
         keyboard_frame = tk.LabelFrame(self.root, text="Keyboard shortcuts")
         keyboard_frame.pack(padx=10, pady=5, fill="x")
@@ -235,9 +199,9 @@ class CanRawByteHoldTester:
         tk.Label(
             keyboard_frame,
             text=(
-                "Hold keys: 1 = mode1 forward, 2 = mode2 forward, 3 = mode3 forward, "
-                "A = left, D = right, S = status, Space = stop, E = estop"
-            )
+                "Hold keys: 1 = mode1 forward, 2 = mode2 forward, "
+                "3 = mode3 forward, A = left, D = right, Space = stop, E = estop"
+            ),
         ).pack(padx=10, pady=5)
 
         self.root.bind("<KeyPress-1>", lambda event: self.start_command(CMD_MODE1_FORWARD, "MODE1_FORWARD"))
@@ -251,23 +215,22 @@ class CanRawByteHoldTester:
 
         self.root.bind("<KeyPress-a>", lambda event: self.start_command(CMD_LEFT, "LEFT"))
         self.root.bind("<KeyRelease-a>", lambda event: self.release_command(CMD_LEFT, "LEFT"))
+
         self.root.bind("<KeyPress-A>", lambda event: self.start_command(CMD_LEFT, "LEFT"))
         self.root.bind("<KeyRelease-A>", lambda event: self.release_command(CMD_LEFT, "LEFT"))
 
         self.root.bind("<KeyPress-d>", lambda event: self.start_command(CMD_RIGHT, "RIGHT"))
         self.root.bind("<KeyRelease-d>", lambda event: self.release_command(CMD_RIGHT, "RIGHT"))
+
         self.root.bind("<KeyPress-D>", lambda event: self.start_command(CMD_RIGHT, "RIGHT"))
         self.root.bind("<KeyRelease-D>", lambda event: self.release_command(CMD_RIGHT, "RIGHT"))
-
-        self.root.bind("<KeyPress-s>", lambda event: self.send_byte(CMD_STATUS, "STATUS"))
-        self.root.bind("<KeyPress-S>", lambda event: self.send_byte(CMD_STATUS, "STATUS"))
 
         self.root.bind("<space>", lambda event: self.stop_now())
         self.root.bind("<KeyPress-e>", lambda event: self.estop_now())
         self.root.bind("<KeyPress-E>", lambda event: self.estop_now())
 
-        self.output = scrolledtext.ScrolledText(self.root, width=130, height=30)
-        self.output.pack(padx=10, pady=10)
+        self.output = scrolledtext.ScrolledText(self.root, width=125, height=28)
+        self.output.pack(padx=10, pady=10, fill="both", expand=True)
 
     def bind_hold_button(self, button, cmd, name):
         button.bind("<ButtonPress-1>", lambda event: self.start_command(cmd, name))
@@ -277,22 +240,6 @@ class CanRawByteHoldTester:
     def log(self, message):
         self.output.insert(tk.END, message + "\n")
         self.output.see(tk.END)
-
-    def log_command_map(self):
-        self.log("========== RAW BYTE COMMAND MAP ==========")
-        for cmd in [
-            CMD_STOP,
-            CMD_MODE1_FORWARD,
-            CMD_MODE2_FORWARD,
-            CMD_MODE3_FORWARD,
-            CMD_RIGHT,
-            CMD_LEFT,
-            CMD_STATUS,
-            CMD_ESTOP,
-        ]:
-            info = COMMAND_INFO[cmd]
-            self.log(f"0x{cmd:02X} = {info['name']} | {info['meaning']}")
-        self.log("==========================================")
 
     def reader_loop(self):
         buffer = ""
@@ -322,77 +269,116 @@ class CanRawByteHoldTester:
         while not self.rx_queue.empty():
             line = self.rx_queue.get()
             self.log(f"RX: {line}")
-            self.interpret_line(line)
+            self.handle_rx_line(line)
 
         if self.running:
             self.root.after(100, self.process_rx_queue)
 
-    def interpret_line(self, line):
+    def handle_rx_line(self, line):
         if "DRY=1" in line:
-            self.log("[WARNING] Arduino reports DRY=1. VESC CAN commands are dry-run only.")
+            self.log("[WARNING] Arduino reports DRY=1. CAN/VESC commands are dry-run only.")
 
         if "DRY=0" in line:
-            self.log("[OK] Arduino reports DRY=0. Real VESC CAN output is active.")
+            self.log("[OK] Arduino reports DRY=0. Real CAN/VESC output is active.")
 
-        if "CAN_READY=1" in line:
-            self.log("[OK] CAN_READY=1. FDCAN2 initialized.")
-
-        if "CAN_READY=0" in line:
-            self.log("[WARNING] CAN_READY=0. CAN is not initialized; movement should be blocked.")
+        if "CAN_BEGIN_FAILED" in line:
+            self.log("[ERROR] Arduino CAN initialization failed. Check GIGA CAN library, pins, transceiver, and bitrate.")
+            self.stat_text_vars["can"].set("CAN: begin failed")
 
         if "CAN_TX_FAIL" in line:
-            self.log("[WARNING] CAN transmit failed. Check VESC power, CANH/CANL, GND, bitrate, VESC IDs, STBY D7, and termination.")
-
-        if "CAN_TX_FAILS=0" in line:
-            self.log("[OK] CAN_TX_FAILS=0.")
-
-        if "CAN_FAULT=1" in line:
-            self.log("[WARNING] CAN_FAULT=1. Arduino latched a CAN fault; send STOP to clear.")
-
-        if "CAN_FAULT_LATCHED" in line:
-            self.log("[WARNING] CAN fault is latched. Send STOP, fix bus, then retry.")
-
-        if "CAN_NOT_READY" in line:
-            self.log("[WARNING] Arduino says CAN_NOT_READY.")
+            self.log("[ERROR] Arduino could not transmit a CAN frame. Check transceiver, wiring, termination, and bus power.")
 
         if "PC_TIMEOUT_500MS" in line:
             self.log("[INFO] Arduino timeout triggered and stopped drive.")
 
-        if "DRIVE_DISABLED" in line:
-            self.log("[INFO] Drive disabled.")
+        if "BIN_ESTOP" in line or "BIN,ESTOP" in line:
+            self.log("[INFO] Emergency stop acknowledged by Arduino.")
 
-        if "DRIVE_FORCE_DISABLED" in line:
-            self.log("[WARNING] Drive force-disabled because of CAN fault.")
+        if line.startswith("<STAT,"):
+            self.decode_status_line(line)
 
-        if "MOTOR_RELAY=1" in line or "RELAY=1" in line:
-            self.log("[WARNING] Relay is ON. Brakes may be released.")
+    def decode_status_line(self, line):
+        fields = self.parse_angle_bracket_csv(line)
 
-        if "MOTOR_RELAY=0" in line or "RELAY=0" in line:
-            self.log("[OK] Relay is OFF.")
+        en = fields.get("EN", "?")
+        mode = fields.get("MODE", "?")
+        motion = fields.get("MOTION", "?")
+        left = fields.get("L", "?")
+        right = fields.get("R", "?")
+        relay = fields.get("RELAY", "?")
+        timeout = fields.get("TIMEOUT", "?")
+        estop = fields.get("ESTOP", "?")
 
-        if "MOTORS_STOPPED" in line:
-            self.log("[OK] Motors commanded to zero duty.")
+        can_bitrate = fields.get("CAN_BITRATE", "?")
+        can_rx = fields.get("CAN_RX", "?")
+        can_tx_fails = fields.get("CAN_TX_FAILS", "?")
+        can_last = fields.get("CAN_LAST_TX_STATUS", "?")
 
-        if "BIN_ESTOP" in line:
-            self.log("[ESTOP] Arduino received emergency stop.")
+        l_id = fields.get("L_ID", "?")
+        r_id = fields.get("R_ID", "?")
+
+        l_seen = fields.get("L_SEEN", "?")
+        l_rpm = fields.get("L_RPM", "?")
+        l_curr = fields.get("L_CURR", "?")
+        l_duty = fields.get("L_DUTY_FB", "?")
+        l_vin = fields.get("L_VIN", "?")
+        l_age = fields.get("L_AGE_MS", "?")
+
+        r_seen = fields.get("R_SEEN", "?")
+        r_rpm = fields.get("R_RPM", "?")
+        r_curr = fields.get("R_CURR", "?")
+        r_duty = fields.get("R_DUTY_FB", "?")
+        r_vin = fields.get("R_VIN", "?")
+        r_age = fields.get("R_AGE_MS", "?")
+
+        self.stat_text_vars["drive"].set(f"Drive: {'enabled' if en == '1' else 'disabled' if en == '0' else en}")
+        self.stat_text_vars["mode"].set(f"Mode: {mode}")
+        self.stat_text_vars["motion"].set(f"Motion: {motion}")
+        self.stat_text_vars["left"].set(f"Left target: {left}  ID={l_id}")
+        self.stat_text_vars["right"].set(f"Right target: {right}  ID={r_id}")
+        self.stat_text_vars["relay"].set(f"Relay: {'active' if relay == '1' else 'off' if relay == '0' else relay}")
+        self.stat_text_vars["timeout"].set(f"Timeout latch: {timeout}")
+        self.stat_text_vars["estop"].set(f"E-stop latch: {estop}")
+        self.stat_text_vars["can"].set(
+            f"CAN: {can_bitrate} bps, RX={can_rx}, TX fails={can_tx_fails}, last={can_last}"
+        )
+        self.stat_text_vars["left_tel"].set(
+            f"Left VESC: seen={l_seen}, rpm={l_rpm}, current={l_curr}A, duty={l_duty}, vin={l_vin}V, age={l_age}ms"
+        )
+        self.stat_text_vars["right_tel"].set(
+            f"Right VESC: seen={r_seen}, rpm={r_rpm}, current={r_curr}A, duty={r_duty}, vin={r_vin}V, age={r_age}ms"
+        )
+
+    @staticmethod
+    def parse_angle_bracket_csv(line):
+        # Converts lines like:
+        # <STAT,EN=0,MODE=NONE,CAN_RX=12,L_RPM=123>
+        # into {"EN": "0", "MODE": "NONE", ...}
+        clean = line.strip()
+        clean = re.sub(r"^<|>$", "", clean)
+        parts = clean.split(",")
+
+        fields = {}
+        for part in parts[1:]:
+            if "=" in part:
+                key, value = part.split("=", 1)
+                fields[key.strip()] = value.strip()
+
+        return fields
 
     def send_byte(self, value, name=None):
         try:
             self.ser.write(bytes([value]))
             self.ser.flush()
 
-            info = COMMAND_INFO.get(value)
-
             if name:
                 self.log(f"TX: {name}  byte=0x{value:02X}  binary={value:08b}")
             else:
                 self.log(f"TX: byte=0x{value:02X}  binary={value:08b}")
 
-            if info:
-                self.log(f"    Meaning: {info['meaning']}")
-
         except Exception as e:
             self.log(f"[SERIAL ERROR] {e}")
+            self.stat_text_vars["connection"].set("Connection: serial error")
 
     def start_command(self, cmd, name):
         if self.active_cmd == cmd:
@@ -420,6 +406,16 @@ class CanRawByteHoldTester:
 
         if self.running:
             self.root.after(SEND_PERIOD_MS, self.send_active_command_loop)
+
+    def auto_status_loop(self):
+        if self.running and self.auto_status_var.get():
+            # Do not spam status while a movement command is being actively held.
+            # Movement commands must keep repeating every 50 ms for safety.
+            if self.active_cmd is None:
+                self.send_byte(CMD_STATUS, "STATUS")
+
+        if self.running:
+            self.root.after(AUTO_STATUS_PERIOD_MS, self.auto_status_loop)
 
     def send_stop_burst(self):
         for _ in range(3):
@@ -465,42 +461,41 @@ class CanRawByteHoldTester:
         self.root.destroy()
 
 
-def print_command_map():
-    print("Command map:")
-    for cmd in [
-        CMD_STOP,
-        CMD_MODE1_FORWARD,
-        CMD_MODE2_FORWARD,
-        CMD_MODE3_FORWARD,
-        CMD_RIGHT,
-        CMD_LEFT,
-        CMD_STATUS,
-        CMD_ESTOP,
-    ]:
-        info = COMMAND_INFO[cmd]
-        print(f"  0x{cmd:02X} = {info['name']}")
-        print(f"       {info['meaning']}")
-
-
 def main():
     parser = argparse.ArgumentParser()
-    parser.add_argument("--port", default="COM11", help="Serial port, default COM9")
+    parser.add_argument("--port", default="COM13", help="Serial port, default COM9")
     parser.add_argument("--baud", type=int, default=BAUD)
     args = parser.parse_args()
 
     print("======================================")
-    print("CAN Raw-Byte Hold-Button VESC Test")
+    print("CAN Binary Hold-Button VESC Test")
     print("======================================")
-    print("This sends raw bytes, not strings.")
-    print("Use this with the CAN raw-byte Arduino test main.cpp.")
+    print("PC -> Arduino: USB serial raw bytes")
+    print("Arduino -> VESCs: CAN bus")
     print("Default port is COM9.")
     print()
-    print_command_map()
+    print("Command map:")
+    print("  0x00 = STOP")
+    print("  0x01 = MODE 1 FORWARD")
+    print("  0x02 = MODE 2 FORWARD")
+    print("  0x03 = MODE 3 FORWARD")
+    print("  0x04 = RIGHT")
+    print("  0x05 = LEFT")
+    print("  0x06 = STATUS")
+    print("  0x07 = ESTOP")
     print()
 
-    root = tk.Tk()
-    CanRawByteHoldTester(root, args.port, args.baud)
-    root.mainloop()
+    try:
+        root = tk.Tk()
+        CanHoldButtonTester(root, args.port, args.baud)
+        root.mainloop()
+    except serial.SerialException as e:
+        message = f"Could not open serial port {args.port}:\n\n{e}"
+        print(message)
+        try:
+            messagebox.showerror("Serial port error", message)
+        except Exception:
+            pass
 
 
 if __name__ == "__main__":
