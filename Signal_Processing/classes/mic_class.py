@@ -1,4 +1,5 @@
 # mic_class.py
+import time
 import numpy as np
 import scipy.signal as sig
 
@@ -11,36 +12,63 @@ class Mic:
         self.output = None
         self.mic_state = False
 
-        # This will hold incoming audio chunks until we have 16,000 samples
-        self.audio_buffer = []
+        # If a chunk gets louder than this, we assume a command started.
+        # Tune this based on the real mic level: too low triggers on noise,
+        # too high misses spoken commands.
+        self.trigger_threshold = 0.08
+
+        # While True, we are collecting one 1-second command window.
+        self.is_recording = False
+
+        # Holds the current command until it reaches self.samples.
+        self.command_buffer = []
+
+        # After one prediction, ignore audio briefly so one word is not
+        # classified multiple times.
+        self.cooldown_seconds = 0.5
+        self.cooldown_until = 0
 
     def update_mic(self, new_data_list):
         if not new_data_list:
             return
 
-        self.audio_buffer.extend(new_data_list)
+        now = time.time()
+        if now < self.cooldown_until:
+            return
 
-        if len(self.audio_buffer) >= self.samples:
-            chunk_to_process = self.audio_buffer[:self.samples]
-            self.audio_buffer = self.audio_buffer[self.samples:]
+        data_array = np.array(new_data_list, dtype=np.float32)
+        data_array = data_array / 32768.0
+        max_volume = np.max(np.abs(data_array))
 
-            data_array = np.array(chunk_to_process, dtype=np.float32)
-            data_array = data_array / 32768.0
+        # STATE 1: waiting for a loud enough sound to start a command.
+        if not self.is_recording:
+            if max_volume < self.trigger_threshold:
+                return
 
-            # --- NEW: VOLUME GATE ---
-            # Check the maximum volume of this 1-second chunk
-            max_volume = np.max(np.abs(data_array))
+            # A command probably started, so begin the 1-second capture.
+            self.is_recording = True
+            self.command_buffer = []
 
-            # If the volume is lower than 10% of the max mic capability, it's just room noise
-            if max_volume < 0.50:
-                # Uncomment the print statement below to tune your threshold!
-                # print(f"Quiet... (Volume: {max_volume:.3f})")
-                return  # Skip the AI entirely
+        # STATE 2: recording the command window.
+        self.command_buffer.extend(new_data_list)
 
-            # 4. Process and Predict (Only runs if someone is actually making noise)
-            processed = self.pre_processing(data_array, fs=self.fs, samples=self.samples)
-            self.predict(processed, fs=self.fs)
-            self.signal_mic_change()
+        # Wait until the command window has exactly 1 second of audio.
+        if len(self.command_buffer) < self.samples:
+            return
+
+        chunk_to_process = self.command_buffer[:self.samples]
+
+        # Reset before running the model so the next command starts fresh.
+        self.is_recording = False
+        self.command_buffer = []
+        self.cooldown_until = now + self.cooldown_seconds
+
+        data_array = np.array(chunk_to_process, dtype=np.float32)
+        data_array = data_array / 32768.0
+
+        processed = self.pre_processing(data_array, fs=self.fs, samples=self.samples)
+        self.predict(processed, fs=self.fs)
+        self.signal_mic_change()
 
     def pre_processing(self, data, fs=16_000, samples=16_000):
         b, a = sig.butter(3, 6_000, 'low', fs=fs)
