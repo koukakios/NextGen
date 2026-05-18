@@ -48,7 +48,7 @@ class Camera:
         """
         Ξεκινάει το κεντρικό loop της κάμερας.
         """
-        print("in camera update state")
+        # print("in camera update state")
         if not self.cap.isOpened():
             print("Error: Could not open the camera.")
             return

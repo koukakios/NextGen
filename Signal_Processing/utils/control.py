@@ -105,7 +105,7 @@ if __name__ == "__main__":
                 my_cam.update_state()
 
                 # 5. Calculate Motor Logic (Reads the latest state updated by the background thread)
-                turning_mode = False 
+                turning_mode = my_emg.turning_mode 
                 uart = signal_to_motor(my_mic.mic_state, my_emg.mode, my_cam.state, turning_mode, uart)
 
                 # 6. The "Smart Timer" Logic for sending data

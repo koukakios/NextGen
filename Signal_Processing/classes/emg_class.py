@@ -21,6 +21,7 @@ class EMG:
         self.event_buffer = np.array([])
         self.trigger_threshold = 0.7
         self.previous_mode = None
+        self.turning_mode = False
 
     def update_mode(self, new_data_list):
         # 1. SAFETY CHECK: Skip if no new data arrived in this loop
@@ -69,7 +70,14 @@ class EMG:
                 print(f"\n--> GEAR SHIFT: Mode is now {self.mode}")
                 self.previous_mode = self.mode
 
+            self.update_turning()
             return self.mode
+        
+    def update_turning(self):
+        if self.mode == (0,0,0):
+            self.turning_mode = True
+        else:
+            self.turning_mode = False
 
 # --- MAIN TESTING SCRIPT ---
 if __name__ == "__main__":
