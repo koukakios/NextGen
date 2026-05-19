@@ -340,11 +340,20 @@ class CanRawByteHoldTester:
         if "CAN_READY=0" in line:
             self.log("[WARNING] CAN_READY=0. CAN is not initialized; movement should be blocked.")
 
-        if "CAN_TX_FAIL" in line:
+        if "<ERR,CAN_TX_FAIL" in line:
             self.log("[WARNING] CAN transmit failed. Check VESC power, CANH/CANL, GND, bitrate, VESC IDs, STBY D7, and termination.")
+
+        if "CAN_TX_OK" in line:
+            self.log("[OK] Arduino queued a classic extended CAN frame. If the VESC still does not move, check VESC CAN ID/bitrate/config and bus wiring.")
+
+        if "<ACK,BIN," in line:
+            self.log("[OK] Arduino accepted the raw-byte command.")
 
         if "CAN_TX_FAILS=0" in line:
             self.log("[OK] CAN_TX_FAILS=0.")
+
+        if "CAN_RX=0" in line:
+            self.log("[WARNING] CAN_RX=0. Arduino has not received VESC status frames; check VESC CAN settings, wiring, power, and termination.")
 
         if "CAN_FAULT=1" in line:
             self.log("[WARNING] CAN_FAULT=1. Arduino latched a CAN fault; send STOP to clear.")
