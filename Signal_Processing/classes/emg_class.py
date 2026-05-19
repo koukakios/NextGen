@@ -67,7 +67,7 @@ class EMG:
                 self.event_buffer = np.array([])
 
             if self.mode != self.previous_mode:
-                print(f"\n--> GEAR SHIFT: Mode is now {self.mode}")
+                print(f"new gear: {self.mode}")
                 self.previous_mode = self.mode
 
             self.update_turning()

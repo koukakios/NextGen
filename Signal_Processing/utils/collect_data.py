@@ -10,89 +10,58 @@ serial_buffer = b''
 
 
 def get_latest_data(ser):
-    """
-    Reads all currently available data in the serial buffer,
-    parses complete packets, and returns them as two lists.
-    """
     global serial_buffer
-    emg_data = []
-    mic_data = []
+    emg_data, mic_data = [], []
 
-    # Grab whatever new bytes are sitting in the computer's serial buffer
     bytes_waiting = ser.in_waiting
     if bytes_waiting > 0:
         serial_buffer += ser.read(bytes_waiting)
 
-    # Hunt for packets in our buffer
-    i = 0
-    while i < len(serial_buffer) - 1:
+    while True:
+        # 1. Quickly find the next headers using optimized C-level search
+        emg_idx = serial_buffer.find(b'\xAA\xAA')
+        mic_idx = serial_buffer.find(b'\xBB\xBB')
 
-        # --- CHECK FOR EMG PACKET (Header: 0xAA 0xAA) ---
-        if serial_buffer[i:i + 2] == b'\xAA\xAA':
-            # Ensure we have the full 6 bytes (2 header + 4 float)
-            if i + 6 <= len(serial_buffer):
-                payload = serial_buffer[i + 2:i + 6]
-                emg_value = struct.unpack('<f', payload)[0]
-                emg_data.append(emg_value)
-                i += 6  # Jump forward past this packet
-                continue
+        # 2. If NO headers are found, the buffer is just garbage noise. Wipe it.
+        if emg_idx == -1 and mic_idx == -1:
+            # Keep the very last byte just in case it's half of a new header
+            serial_buffer = serial_buffer[-1:] if len(serial_buffer) > 0 else b''
+            break
+
+        # 3. Figure out which packet type comes first in the buffer
+        valid_indices = [idx for idx in [emg_idx, mic_idx] if idx != -1]
+        first_idx = min(valid_indices)
+
+        # --- PROCESS EMG ---
+        if first_idx == emg_idx:
+            if first_idx + 6 <= len(serial_buffer):
+                payload = serial_buffer[first_idx + 2 : first_idx + 6]
+                emg_data.append(struct.unpack('<f', payload)[0])
+                # Chop off the processed packet
+                serial_buffer = serial_buffer[first_idx + 6:]
             else:
-                break  # We have half a packet; wait for next function call
+                # We have half a packet, wait for next function call
+                serial_buffer = serial_buffer[first_idx:]
+                break
 
-        # --- CHECK FOR MIC PACKET (Header: 0xBB 0xBB) ---
-        elif serial_buffer[i:i + 2] == b'\xBB\xBB':
-            # Ensure we have at least 4 bytes (2 header + 2 length)
-            if i + 4 <= len(serial_buffer):
-                payload_length = struct.unpack('<H', serial_buffer[i + 2:i + 4])[0]
-
-                # Ensure we have the full audio payload
-                if i + 4 + payload_length <= len(serial_buffer):
-                    audio_payload = serial_buffer[i + 4: i + 4 + payload_length]
+        # --- PROCESS MIC ---
+        elif first_idx == mic_idx:
+            if first_idx + 4 <= len(serial_buffer):
+                payload_length = struct.unpack('<H', serial_buffer[first_idx + 2 : first_idx + 4])[0]
+                
+                if first_idx + 4 + payload_length <= len(serial_buffer):
+                    audio_payload = serial_buffer[first_idx + 4 : first_idx + 4 + payload_length]
                     num_samples = payload_length // 2
-
-                    audio_samples = struct.unpack(f'<{num_samples}h', audio_payload)
-                    mic_data.extend(audio_samples)
-
-                    i += 4 + payload_length  # Jump forward past this packet
-                    continue
+                    mic_data.extend(struct.unpack(f'<{num_samples}h', audio_payload))
+                    # Chop off the processed packet
+                    serial_buffer = serial_buffer[first_idx + 4 + payload_length:]
                 else:
-                    break  # We have half a packet; wait for next function call
+                    # We have half a packet, wait for next function call
+                    serial_buffer = serial_buffer[first_idx:]
+                    break
+            else:
+                # We only have half the header, wait for next function call
+                serial_buffer = serial_buffer[first_idx:]
+                break
 
-        # If it's not a header, move forward 1 byte to keep hunting
-        i += 1
-
-    # Chop off the data we just successfully parsed, keeping the leftovers for next time
-    serial_buffer = serial_buffer[i:]
-
-    # Simply return the two lists!
     return emg_data, mic_data
-
-
-# ====================================================================
-# Example of how to use it in your main script
-# ====================================================================
-if __name__ == '__main__':
-    try:
-        with serial.Serial(SERIAL_PORT, BAUD_RATE, timeout=0) as ser:
-            ser.reset_input_buffer()
-            time.sleep(1)  # Let connection stabilize
-
-            print("Listening for sensor data... (Press Ctrl+C to stop)")
-
-            # This is your main program loop
-            while True:
-                # 1. Call the function and get your two variables
-                latest_emg, latest_mic = get_latest_data(ser)
-
-                # 2. Do whatever you want with the data!
-                if latest_emg:
-                    print(f"Received {len(latest_emg)} new EMG samples. Latest: {latest_emg[-1]:.2f} mV")
-
-                if latest_mic:
-                    print(f"Received {len(latest_mic)} new Microphone samples.")
-
-                # Small delay so we aren't running the CPU at 100%
-                time.sleep(0.01)
-
-    except KeyboardInterrupt:
-        print("\nDisconnected.")

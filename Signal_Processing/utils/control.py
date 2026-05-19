@@ -3,7 +3,7 @@ import serial
 import time
 from tensorflow.keras.models import load_model
 import threading
-import queue  # <-- ADDED: For thread-safe data passing
+import queue 
 import subprocess
 
 def run_parallel_script(script_name):
@@ -23,19 +23,34 @@ from utils.Config import deadzone_ratio, cam_index
 PORT = '/dev/cu.usbmodem101'
 BAUD = 1_000_000
 
-# --- Dedicated Mic Worker Function ---
+# --- Dedicated Mic Worker Thread ---
 def mic_processing_thread(mic_obj, data_queue):
     """Continuously runs the mic AI model in the background."""
     while True:
-        # Wait until there is new audio data in the queue
         mic_data = data_queue.get()
-        
-        if mic_data is None:  # Poison pill to safely stop thread
+        if mic_data is None:  
             break
             
-        # Process the data (This is the heavy task that used to block your loop)
-        mic_obj.update_mic(mic_data)
+        try:
+            # The safety net!
+            mic_obj.update_mic(mic_data)
+        except Exception as e:
+            # If the AI model fails, print the exact error to the terminal
+            print(f"\n[MIC THREAD ERROR]: {e}")
+            
         data_queue.task_done()
+
+# --- Dedicated Camera Worker Thread ---
+def camera_processing_thread(cam_obj):
+    """Continuously processes OpenCV video frames in the background."""
+    while True:
+        # This handles the heavy OpenCV/DNN frame processing
+        # It updates cam_obj.state automatically without blocking the main loop
+        cam_obj.update_state()
+        
+        # A tiny sleep here is okay because it only slows down the camera thread, 
+        # NOT the main Serial transmission loop.
+        time.sleep(0.01) 
 # ------------------------------------------
 
 if __name__ == "__main__":
@@ -49,14 +64,9 @@ if __name__ == "__main__":
     print("Loading AI Model...")
     my_mic.model = load_model('model1.keras')
 
-    # --- NEW: Setup Queue and Start Mic Thread ---
-    # maxsize ensures we don't build up infinite lag if the model is slower than incoming data
     mic_queue = queue.Queue(maxsize=5) 
-    
-    # daemon=True ensures the thread dies automatically when the main program stops
     mic_thread = threading.Thread(target=mic_processing_thread, args=(my_mic, mic_queue), daemon=True)
     mic_thread.start()
-    # ---------------------------------------------
 
     # Initialize Camera
     print("Loading Camera and Face Models...")
@@ -68,33 +78,34 @@ if __name__ == "__main__":
         deadzone_ratio=deadzone_ratio
     )
 
+    # Start Camera Thread
+    cam_thread = threading.Thread(target=camera_processing_thread, args=(my_cam,), daemon=True)
+    cam_thread.start()
+    # ---------------------------------------------
+
     print(f"Connecting to Arduino on {PORT}...")
 
-    # --- Initialize State Tracking Variables Before the Loop ---
-    uart = 0  # Initial motor state (still = 0)
+    uart = 0  
     last_sent_time = time.time()
     last_sent_uart = None
 
     try:
-        # timeout=0 ensures non-blocking buffer reads
         with serial.Serial(PORT, BAUD, timeout=0) as ser:
             ser.reset_input_buffer()
-            time.sleep(2)  # Give Arduino time to reset
+            time.sleep(2)  
 
-            print("System Ready! Listening for sensor data... (Press Ctrl+C to stop)")
+            print("\nSystem Ready! Listening for sensor data... (Press Ctrl+C to stop)")
+            print("-" * 50)
 
             while True:
-                # 1. Grab all available packets
+                # 1. Grab all available packets (Must be as fast as possible)
                 latest_emg_list, latest_mic_list = get_latest_data(ser)
 
                 # 2. Update Mic (Hand off to background thread)
                 if latest_mic_list:
                     try:
-                        # put_nowait hands the data to the thread instantly.
                         mic_queue.put_nowait(latest_mic_list)
-                    except queue.Full:
-                        # If the AI model is still processing the last batch, drop this frame.
-                        # This prevents the system from lagging further and further behind real-time.
+                    except queue.Full: 
                         pass
 
                 # 3. Update EMG 
@@ -102,27 +113,25 @@ if __name__ == "__main__":
                     my_emg.update_mode(latest_emg_list)
 
                 # 4. Get Camera direction
-                my_cam.update_state()
+                # REMOVED: my_cam.update_state() is now running in the background thread!
+                # We just read `my_cam.state` directly in step 5.
 
-                # 5. Calculate Motor Logic (Reads the latest state updated by the background thread)
+                # 5. Calculate Motor Logic 
                 turning_mode = my_emg.turning_mode 
                 uart = signal_to_motor(my_mic.mic_state, my_emg.mode, my_cam.state, turning_mode, uart)
 
-                # 6. The "Smart Timer" Logic for sending data
+                # 6. "Smart Timer" Logic for sending data
                 current_time = time.time()
-                # Send if 100ms passed OR if the command actually changed instantly
                 if (current_time - last_sent_time >= 0.1) or (uart != last_sent_uart):
                     ser.write(uart.to_bytes(1, 'big'))
                     last_sent_time = current_time
                     last_sent_uart = uart
 
-                # 7. UI Update for the console (Added Camera State)
+                # 7. UI Update for the console (Clean, single-line update)
                 if latest_emg_list and not my_emg.is_collecting:
                     print(f"EMG Gear: {my_emg.mode} | Mic: {my_mic.mic_state} | Cam: {my_cam.state}    ", end='\r')
 
-                # Small delay to keep CPU usage low
-                time.sleep(0.01)
-            print("\ndone")
+                # REMOVED: time.sleep(0.01) from main loop so the Serial buffer never overflows.
             
     except KeyboardInterrupt:
-        print("\nProgram stopped safely.")
+        print("\n\nProgram stopped safely.")

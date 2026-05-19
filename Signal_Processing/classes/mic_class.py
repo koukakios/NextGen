@@ -79,7 +79,7 @@ class Mic:
         if confidence > 0.75:
             # Only print it if it's a NEW state (stops it from spamming "ON, ON, ON")
             if self.output != predicted_label:
-                print(f"\nMic Activated -> Command: {predicted_label.upper()} (Confidence: {confidence:.2f})")
+                print(f"Command: {predicted_label.upper()} (Confidence: {confidence:.2f})")
                 self.output = predicted_label
         else:
             # If you want to see when it gets confused, uncomment below
