@@ -5,6 +5,7 @@ from tensorflow.keras.models import load_model
 import threading
 import queue 
 import subprocess
+from contextlib import ExitStack
 
 def run_parallel_script(script_name):
     subprocess.run(["python", script_name])
@@ -21,6 +22,7 @@ from utils.Config import DNN_PROTO, DNN_MODEL, LBF_MODEL
 from utils.Config import deadzone_ratio, cam_index
 
 PORT = '/dev/cu.usbmodem101'
+PORT2 = '/dev/cu.usbmodem1101'
 BAUD = 1_000_000
 
 # --- Dedicated Mic Worker Thread ---
@@ -60,8 +62,8 @@ if __name__ == "__main__":
     my_emg = EMG()
 
     # Initialize Mic and load model
-    my_mic = Mic(fs=16_000, samples=16_000)
     print("Loading AI Model...")
+    my_mic = Mic(fs=16_000, samples=16_000)
     my_mic.model = load_model('model1.keras')
 
     mic_queue = queue.Queue(maxsize=5) 
@@ -83,22 +85,27 @@ if __name__ == "__main__":
     cam_thread.start()
     # ---------------------------------------------
 
-    print(f"Connecting to Arduino on {PORT}...")
+    print(f"Connecting to Arduinos on:\n -> Main Input/Output: {PORT}\n -> Auxiliary Output: {PORT2}...")
 
-    uart = 0  
+    uart = 0b000  
     last_sent_time = time.time()
     last_sent_uart = None
 
     try:
-        with serial.Serial(PORT, BAUD, timeout=0) as ser:
+        # ExitStack manages opening both serial ports simultaneously and ensures both close on exit
+        with ExitStack() as stack:
+            ser = stack.enter_context(serial.Serial(PORT, BAUD, timeout=0))
+            ser2 = stack.enter_context(serial.Serial(PORT2, BAUD, timeout=0))
+            
             ser.reset_input_buffer()
-            time.sleep(2)  
+            ser2.reset_output_buffer()
+            time.sleep(2)  # Shared bootloader stability pause
 
             print("\nSystem Ready! Listening for sensor data... (Press Ctrl+C to stop)")
             print("-" * 50)
 
             while True:
-                # 1. Grab all available packets (Must be as fast as possible)
+                # 1. Grab all available packets (Must be as fast as possible from master port)
                 latest_emg_list, latest_mic_list = get_latest_data(ser)
 
                 # 2. Update Mic (Hand off to background thread)
@@ -112,26 +119,27 @@ if __name__ == "__main__":
                 if latest_emg_list and my_mic.mic_state:
                     my_emg.update_mode(latest_emg_list)
 
-                # 4. Get Camera direction
-                # REMOVED: my_cam.update_state() is now running in the background thread!
-                # We just read `my_cam.state` directly in step 5.
-
                 # 5. Calculate Motor Logic 
-                turning_mode = my_emg.turning_mode 
+                turning_mode = my_emg.turning_mode
+            
                 uart = signal_to_motor(my_mic.mic_state, my_emg.mode, my_cam.state, turning_mode, uart)
 
-                # 6. "Smart Timer" Logic for sending data
+                # 6. "Smart Timer" Logic for sending data to BOTH controllers
                 current_time = time.time()
                 if (current_time - last_sent_time >= 0.1) or (uart != last_sent_uart):
-                    ser.write(uart.to_bytes(1, 'big'))
+                    byte_data = uart.to_bytes(1, 'big')
+                    
+                    # Send transmission to both endpoints simultaneously
+                    ser2.write(byte_data)
+                    
                     last_sent_time = current_time
                     last_sent_uart = uart
 
                 # 7. UI Update for the console (Clean, single-line update)
                 if latest_emg_list and not my_emg.is_collecting:
-                    print(f"EMG Gear: {my_emg.mode} | Mic: {my_mic.mic_state} | Cam: {my_cam.state}    ", end='\r')
+                    print(f"EMG Gear: {my_emg.mode} | Mic: {my_mic.mic_state} | Cam: {my_cam.state}", end='\r')
 
                 # REMOVED: time.sleep(0.01) from main loop so the Serial buffer never overflows.
             
     except KeyboardInterrupt:
-        print("\n\nProgram stopped safely.")
+        print("\n\nProgram stopped safely. Both serial ports closed cleanly.")

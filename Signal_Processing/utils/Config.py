@@ -6,4 +6,4 @@ DNN_PROTO = "/Users/niekvanvroonhoven/Downloads/deploy.prototxt.txt"
 DNN_MODEL = "/Users/niekvanvroonhoven/Downloads/res10_300x300_ssd_iter_140000.caffemodel"
 LBF_MODEL = "/Users/niekvanvroonhoven/Downloads/lbfmodel.yaml"
 cam_index = 0
-deadzone_ratio = 0.06
+deadzone_ratio = 0.1
