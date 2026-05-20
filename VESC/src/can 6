@@ -1,403 +1,166 @@
 #include <Arduino.h>
 #include <math.h>
-#include <string.h>
 
 // --------------------------------------------------
-// Wheelchair RAW-BYTE TEST for 2 VESCs over CAN
-// Arduino GIGA + NEXT GIGA shield + MCP2562
+// SIMPLE wheelchair VESC CAN test code
+// Arduino GIGA + CAN transceiver/shield + VESC
 //
-// Same PC protocol as your working UART code:
+// PC/Python sends one command byte:
+//   0 = stop
+//   1 = forward slow
+//   2 = forward medium
+//   3 = forward fast
+//   4 = right
+//   5 = left
+//   6 = status
+//   7 = emergency stop
 //
-// PC sends ONE RAW BYTE:
-//
-//   0b000 = 0x00 = stop
-//   0b001 = 0x01 = driving mode 1 forward
-//   0b010 = 0x02 = driving mode 2 forward
-//   0b011 = 0x03 = driving mode 3 forward
-//   0b100 = 0x04 = right
-//   0b101 = 0x05 = left
-//   0b110 = 0x06 = status
-//   0b111 = 0x07 = emergency stop
-//
-// NEXT GIGA shield:
-//   CANRX/CANTX header pins use FDCAN2.
-//   CANRX = D93 = PB5
-//   CANTX = D94 = PB13
-//   MCP2562 STBY = D7
-//
-// VESC relay/brake release:
-//   DS-9 pin 4 = Analog 1 on GIGA shield.
-//   A1 LOW activates relay/brake release.
-//
-// Safety:
-//   - Movement command automatically enables drive.
-//   - Stop command drops relay first, then sends zero duty.
-//   - If no valid movement command is received for 500 ms,
-//     motors stop and relay disables.
-//   - ESTOP stops motors and disables relay.
+// IMPORTANT:
+// - Put this file as src/main.cpp
+// - Do NOT keep another .cpp file with setup() and loop() inside src/
+// - Wheels off the ground for testing
 // --------------------------------------------------
 
 #ifndef ARDUINO_GIGA
-#error This sketch is intended for Arduino GIGA R1 WiFi.
+#error This code is for Arduino GIGA R1 WiFi.
 #endif
 
-// --------------------------------------------------
-// ACANFD_GIGA_R1 setup
-// --------------------------------------------------
-// NEXT shield uses FDCAN2, not FDCAN1.
-
+// Required by ACANFD_GIGA_R1. Must be before the include.
+// We use FDCAN2, so FDCAN2 gets RAM and FDCAN1 gets 0.
 static const uint32_t FDCAN1_MESSAGE_RAM_WORD_SIZE = 0;
 static const uint32_t FDCAN2_MESSAGE_RAM_WORD_SIZE = 2560;
 
 #include <ACANFD_GIGA_R1.h>
-
 #define VESC_CAN fdcan2
 
-// --------------------------------------------------
-// Software-only test switch
-// --------------------------------------------------
-
-constexpr bool DRY_RUN = false;
-
-// --------------------------------------------------
-// PC communication port
-// --------------------------------------------------
-
-#define PC_SERIAL Serial
-
-// --------------------------------------------------
-// CAN settings
-// --------------------------------------------------
+// -------------------- User settings --------------------
 
 constexpr uint32_t CAN_BITRATE = 500000;
 
-// These must match VESC Tool CAN IDs.
-constexpr uint8_t LEFT_VESC_ID = 1;
+// These must match VESC Tool.
+constexpr uint8_t LEFT_VESC_ID  = 1;
 constexpr uint8_t RIGHT_VESC_ID = 2;
 
-// NEXT shield MCP2562 standby pin.
-// MCP2562 STBY LOW  = normal CAN operation.
-// MCP2562 STBY HIGH = standby.
+// CAN transceiver standby pin on your shield.
+// MCP2562: LOW = normal mode, HIGH = standby.
 constexpr uint8_t CAN_STBY_PIN = 7;
-constexpr uint8_t CAN_STBY_NORMAL_LEVEL = LOW;
-constexpr uint8_t CAN_STBY_STANDBY_LEVEL = HIGH;
+
+// Relay / brake release pin.
+// If your relay works backwards, swap RELAY_ON and RELAY_OFF.
+constexpr uint8_t MOTOR_RELAY_PIN = A1;
+constexpr uint8_t RELAY_ON  = LOW;
+constexpr uint8_t RELAY_OFF = HIGH;
+
+// Safe low test duties. Increase only after it works.
+constexpr float DUTY_SLOW = 0.45f;
+constexpr float DUTY_MED  = 0.50f;
+constexpr float DUTY_FAST = 0.55f;
+constexpr float DUTY_TURN = 0.40f;
+
+// Safety timeout. Python repeats movement commands below this time.
+constexpr unsigned long COMMAND_TIMEOUT_MS = 500;
+constexpr unsigned long SEND_EVERY_MS = 20;
+
+// Set this true only if you want CAN RX spam every 500 ms.
+constexpr bool DEBUG_CAN_RX_PRINT = false;
+
+// VESC CAN command IDs.
+constexpr uint32_t CAN_PACKET_SET_DUTY = 0;
+
+// -------------------- State --------------------
 
 bool canReady = false;
-bool canFaultLatched = false;
-
-uint32_t lastCanTxStatus = 0;
-uint32_t canTxFailCount = 0;
-uint32_t canRxCount = 0;
-
-// --------------------------------------------------
-// VESC CAN packet IDs
-// --------------------------------------------------
-// VESC CAN extended ID:
-//   extended_id = (packet_id << 8) | vesc_can_id
-
-constexpr uint32_t CAN_PACKET_SET_DUTY = 0;
-constexpr uint32_t CAN_PACKET_STATUS = 9;
-constexpr uint32_t CAN_PACKET_STATUS_5 = 27;
-
-// --------------------------------------------------
-// Motor relay / brake release
-// --------------------------------------------------
-
-constexpr uint8_t MOTOR_RELAY_PIN = A1;
-constexpr uint8_t MOTOR_RELAY_ACTIVE_LEVEL = LOW;
-constexpr uint8_t MOTOR_RELAY_INACTIVE_LEVEL = HIGH;
-
-bool motorRelayActive = false;
-
-// --------------------------------------------------
-// Timing
-// --------------------------------------------------
-
-constexpr unsigned long EXPECTED_PC_COMMAND_PERIOD_MS = 50;
-constexpr unsigned long PC_TIMEOUT_MS = 500;
-
-// CAN command refresh.
-// 20 ms = 50 Hz.
-constexpr unsigned long KEEPALIVE_MS = 20;
-
-constexpr unsigned long STOP_BEFORE_CHANGE_MS = 150;
-
-// --------------------------------------------------
-// Motion and mode states
-// --------------------------------------------------
-
-enum MotionState {
-  STOPPED,
-  FORWARD,
-  REVERSE,
-  LEFT,
-  RIGHT
-};
-
-enum DrivingMode {
-  MODE_1,
-  MODE_2,
-  MODE_3
-};
-
-enum BinaryCommand {
-  CMD_STOP   = 0b000,
-  CMD_MODE_1 = 0b001,
-  CMD_MODE_2 = 0b010,
-  CMD_MODE_3 = 0b011,
-  CMD_RIGHT  = 0b100,
-  CMD_LEFT   = 0b101,
-  CMD_STATUS = 0b110,
-  CMD_ESTOP  = 0b111
-};
-
 bool driveEnabled = false;
-bool modeSelected = false;
-bool timeoutLatched = false;
-bool emergencyLatched = false;
 
-MotionState motion = STOPPED;
-DrivingMode drivingMode = MODE_1;
+float leftDuty = 0.0f;
+float rightDuty = 0.0f;
 
-float leftTarget = 0.0f;
-float rightTarget = 0.0f;
+unsigned long lastCommandMs = 0;
+unsigned long lastSendMs = 0;
 
-unsigned long lastValidMovementCommandMs = 0;
-unsigned long lastKeepAliveMs = 0;
+uint32_t canErrorCode = 0;
+uint32_t canRamNeeded = 0;
 
-bool transitionPending = false;
-unsigned long transitionStartMs = 0;
+uint32_t canRxCount = 0;
+bool haveLastCanRxFrame = false;
+CANFDMessage lastCanRxFrame;
+unsigned long lastCanRxPrintMs = 0;
 
-float pendingLeftTarget = 0.0f;
-float pendingRightTarget = 0.0f;
-MotionState pendingMotion = STOPPED;
+uint32_t canTxOk = 0;
+uint32_t canTxFail = 0;
+uint32_t lastCanTxStatus = 0;
 
-// --------------------------------------------------
-// TEST duty presets
-// --------------------------------------------------
-// These are intentionally low for first CAN testing.
-// After confirming direction and safety, increase carefully.
+// -------------------- Helpers --------------------
 
-constexpr float DUTY_MODE_1 = 0.30f;
-constexpr float DUTY_MODE_2 = 0.40f;
-constexpr float DUTY_MODE_3 = 0.50f;
-
-constexpr float TURN_DUTY_FACTOR = 0.80f;
-constexpr float REVERSE_DUTY_FACTOR = 0.70f;
-
-// --------------------------------------------------
-// Telemetry cache from VESC CAN status frames
-// --------------------------------------------------
-
-struct VescTelemetryCache {
-  bool seenStatus = false;
-  bool seenStatus5 = false;
-  unsigned long lastRxMs = 0;
-  int32_t rpm = 0;
-  float current = 0.0f;
-  float duty = 0.0f;
-  float vin = 0.0f;
-};
-
-VescTelemetryCache leftTel;
-VescTelemetryCache rightTel;
-
-// --------------------------------------------------
-// Helper functions
-// --------------------------------------------------
-
-const char* motionToString(MotionState s) {
-  switch (s) {
-    case STOPPED: return "STOP";
-    case FORWARD: return "FORWARD";
-    case REVERSE: return "REVERSE";
-    case LEFT:    return "LEFT";
-    case RIGHT:   return "RIGHT";
-    default:      return "UNKNOWN";
-  }
-}
-
-const char* drivingModeToString(DrivingMode m) {
-  switch (m) {
-    case MODE_1: return "MODE1";
-    case MODE_2: return "MODE2";
-    case MODE_3: return "MODE3";
-    default:     return "UNKNOWN";
-  }
-}
-
-float getDriveDuty() {
-  switch (drivingMode) {
-    case MODE_1:
-      return DUTY_MODE_1;
-
-    case MODE_2:
-      return DUTY_MODE_2;
-
-    case MODE_3:
-      return DUTY_MODE_3;
-
-    default:
-      return DUTY_MODE_1;
-  }
-}
-
-float getTurnDuty() {
-  return getDriveDuty() * TURN_DUTY_FACTOR;
-}
-
-float getReverseDuty() {
-  return getDriveDuty() * REVERSE_DUTY_FACTOR;
-}
-
-void markValidMovementCommand() {
-  lastValidMovementCommandMs = millis();
-}
-
-int16_t readInt16BE(const uint8_t* data) {
-  return int16_t((uint16_t(data[0]) << 8) | uint16_t(data[1]));
-}
-
-int32_t readInt32BE(const uint8_t* data) {
-  return int32_t(
-    (uint32_t(data[0]) << 24) |
-    (uint32_t(data[1]) << 16) |
-    (uint32_t(data[2]) << 8) |
-    uint32_t(data[3])
-  );
-}
-
-void writeInt32BE(uint8_t* data, int32_t value) {
+void writeInt32BE(uint8_t *data, int32_t value) {
   data[0] = uint8_t((uint32_t(value) >> 24) & 0xFF);
   data[1] = uint8_t((uint32_t(value) >> 16) & 0xFF);
   data[2] = uint8_t((uint32_t(value) >> 8) & 0xFF);
   data[3] = uint8_t(uint32_t(value) & 0xFF);
 }
 
-uint32_t makeVescCanId(uint32_t packetId, uint8_t vescId) {
-  return ((packetId & 0x1FFFFF) << 8) | uint32_t(vescId);
-}
-
-uint32_t getVescPacketIdFromCanId(uint32_t extendedId) {
-  return extendedId >> 8;
-}
-
-uint8_t getVescSourceIdFromCanId(uint32_t extendedId) {
-  return uint8_t(extendedId & 0xFF);
-}
-
 float clampDuty(float duty) {
-  if (duty > 0.95f) {
-    return 0.95f;
-  }
-
-  if (duty < -0.95f) {
-    return -0.95f;
-  }
-
+  if (duty > 0.95f) return 0.95f;
+  if (duty < -0.95f) return -0.95f;
   return duty;
 }
 
-uint32_t getCanFlags() {
-  if (DRY_RUN || !canReady) {
-    return 0;
+uint32_t makeVescCanId(uint32_t packetId, uint8_t vescId) {
+  // VESC extended CAN ID = command in bits 15..8, VESC ID in bits 7..0.
+  return (packetId << 8) | uint32_t(vescId);
+}
+
+void setRelay(bool on) {
+  digitalWrite(MOTOR_RELAY_PIN, on ? RELAY_ON : RELAY_OFF);
+}
+
+void printHexByte(uint8_t value) {
+  if (value < 16) Serial.print('0');
+  Serial.print(value, HEX);
+}
+
+void printCanFrame(const CANFDMessage &frame) {
+  Serial.print("CAN RX id=0x");
+  Serial.print(frame.id, HEX);
+  Serial.print(" ext=");
+  Serial.print(frame.ext ? 1 : 0);
+  Serial.print(" len=");
+  Serial.print(frame.len);
+
+  if (frame.ext) {
+    uint8_t vescCommand = uint8_t((frame.id >> 8) & 0xFF);
+    uint8_t vescId = uint8_t(frame.id & 0xFF);
+    Serial.print(" vescCmd=");
+    Serial.print(vescCommand);
+    Serial.print(" vescId=");
+    Serial.print(vescId);
   }
 
-  return VESC_CAN.statusFlags();
-}
+  Serial.print(" data=");
+  uint8_t dataLength = frame.len;
+  if (dataLength > 8) dataLength = 8;
 
-// --------------------------------------------------
-// Protocol reply helpers
-// --------------------------------------------------
-
-void pcAck(const char* message) {
-  PC_SERIAL.print("<ACK,");
-  PC_SERIAL.print(message);
-  PC_SERIAL.println(">");
-}
-
-void pcErr(const char* message) {
-  PC_SERIAL.print("<ERR,");
-  PC_SERIAL.print(message);
-  PC_SERIAL.println(">");
-}
-
-void pcEvent(const char* message) {
-  PC_SERIAL.print("<EVT,");
-  PC_SERIAL.print(message);
-  PC_SERIAL.println(">");
-}
-
-void pcWarn(const char* message) {
-  PC_SERIAL.print("<WARN,");
-  PC_SERIAL.print(message);
-  PC_SERIAL.println(">");
-}
-
-// --------------------------------------------------
-// Relay helpers
-// --------------------------------------------------
-
-void setMotorRelay(bool active) {
-  if (DRY_RUN) {
-    motorRelayActive = false;
-    PC_SERIAL.print("<DRY,MOTOR_RELAY_REQUEST=");
-    PC_SERIAL.print(active ? 1 : 0);
-    PC_SERIAL.println(">");
-    return;
+  for (uint8_t i = 0; i < dataLength; i++) {
+    if (i > 0) Serial.print(' ');
+    printHexByte(frame.data[i]);
   }
 
-  digitalWrite(
-    MOTOR_RELAY_PIN,
-    active ? MOTOR_RELAY_ACTIVE_LEVEL : MOTOR_RELAY_INACTIVE_LEVEL
-  );
-
-  motorRelayActive = active;
-
-  PC_SERIAL.print("<EVT,MOTOR_RELAY=");
-  PC_SERIAL.print(motorRelayActive ? 1 : 0);
-  PC_SERIAL.println(">");
+  Serial.println();
 }
 
-void setupMotorRelay() {
-  digitalWrite(MOTOR_RELAY_PIN, MOTOR_RELAY_INACTIVE_LEVEL);
-  pinMode(MOTOR_RELAY_PIN, OUTPUT);
-  digitalWrite(MOTOR_RELAY_PIN, MOTOR_RELAY_INACTIVE_LEVEL);
-
-  motorRelayActive = false;
-  PC_SERIAL.println("<BOOT,MOTOR_RELAY_OFF>");
-}
-
-// --------------------------------------------------
-// CAN setup
-// --------------------------------------------------
-
-void setupCanTransceiver() {
-  pinMode(CAN_STBY_PIN, OUTPUT);
-
-  // Release MCP2562 from standby.
-  digitalWrite(CAN_STBY_PIN, CAN_STBY_NORMAL_LEVEL);
-  delay(10);
-
-  PC_SERIAL.println("<BOOT,CAN_TRANSCEIVER_STBY_LOW>");
-}
+// -------------------- CAN setup/read/send --------------------
 
 bool setupCan() {
-  if (DRY_RUN) {
-    PC_SERIAL.println("<BOOT,CAN_DRY_RUN>");
-    return true;
-  }
-
-  setupCanTransceiver();
+  pinMode(CAN_STBY_PIN, OUTPUT);
+  digitalWrite(CAN_STBY_PIN, LOW);  // LOW = normal mode for MCP2562
+  delay(10);
 
   ACANFD_GIGA_R1_Settings settings(CAN_BITRATE, DataBitRateFactor::x1);
 
-  // Important for testing:
-  // If no VESC acknowledges a frame, do not keep retransmitting forever.
-  // This prevents the TX FIFO from clogging and spamming STATUS=0x3.
+  // Disable retransmission during debugging so old failed frames do not clog TX.
   settings.mEnableRetransmission = false;
 
-  // Use STM32 FDCAN peripheral, but send classic CAN frames.
+  // Controller runs FDCAN peripheral, but we send classic CAN data frames.
   settings.mModuleMode = ACANFD_GIGA_R1_Settings::NORMAL_FD;
 
   settings.mHardwareRxFIFO0Size = 20;
@@ -412,806 +175,255 @@ bool setupCan() {
   settings.mDriverReceiveFIFO0Size = 20;
   settings.mDriverReceiveFIFO1Size = 0;
 
-  // Explicitly use the NEXT shield CANRX/CANTX FDCAN2 pins.
-  settings.mTxPin = PB_13;
+  // Your RX is proven working on PB_5 because you receive VESC frames.
   settings.mRxPin = PB_5;
 
-  const uint32_t errorCode = VESC_CAN.beginFD(settings);
+  // Try PB_6 for TX because RX works but VESC does not react to Arduino commands.
+  // If this still does not move the motor, try PB_13 here instead.
+  settings.mTxPin = PB_13;
+  // settings.mTxPin = PB_13;
 
-  PC_SERIAL.print("<BOOT,FDCAN2_RAM_REQUIRED_WORDS=");
-  PC_SERIAL.print(VESC_CAN.messageRamRequiredMinimumSize());
-  PC_SERIAL.println(">");
+  canErrorCode = VESC_CAN.beginFD(settings);
+  canRamNeeded = VESC_CAN.messageRamRequiredMinimumSize();
 
-  if (errorCode == 0) {
-    PC_SERIAL.print("<BOOT,CAN_OK,PERIPHERAL=FDCAN2,BITRATE=");
-    PC_SERIAL.print(CAN_BITRATE);
-    PC_SERIAL.println(">");
+  Serial.print("CAN RAM needed=");
+  Serial.println(canRamNeeded);
+
+  if (canErrorCode == 0) {
+    Serial.println("CAN OK");
     return true;
   }
 
-  PC_SERIAL.print("<ERR,CAN_BEGIN_FAILED,PERIPHERAL=FDCAN2,CODE=0x");
-  PC_SERIAL.print(errorCode, HEX);
-  PC_SERIAL.println(">");
-
-  digitalWrite(CAN_STBY_PIN, CAN_STBY_STANDBY_LEVEL);
+  Serial.print("CAN FAILED error=0x");
+  Serial.println(canErrorCode, HEX);
   return false;
 }
 
-// --------------------------------------------------
-// VESC CAN wrapper functions
-// --------------------------------------------------
+void readCanFrames() {
+  if (!canReady) return;
 
-bool sendVescCanFrame(uint8_t vescId, uint32_t packetId, const uint8_t* payload, uint8_t len) {
-  static unsigned long lastCanErrorPrintMs = 0;
+  CANFDMessage rxFrame;
 
-  if (len > 8) {
-    pcErr("CAN_PAYLOAD_TOO_LONG");
-    return false;
+  while (VESC_CAN.receiveFD0(rxFrame)) {
+    canRxCount++;
+    lastCanRxFrame = rxFrame;
+    haveLastCanRxFrame = true;
   }
 
-  if (DRY_RUN) {
-    PC_SERIAL.print("<DRY,CAN,ID=");
-    PC_SERIAL.print(vescId);
-    PC_SERIAL.print(",PACKET=");
-    PC_SERIAL.print(packetId);
-    PC_SERIAL.print(",LEN=");
-    PC_SERIAL.print(len);
-    PC_SERIAL.print(",DATA=");
+  if (!DEBUG_CAN_RX_PRINT) return;
 
-    for (uint8_t i = 0; i < len; i++) {
-      if (payload[i] < 16) {
-        PC_SERIAL.print('0');
-      }
-      PC_SERIAL.print(payload[i], HEX);
+  if (millis() - lastCanRxPrintMs >= 500) {
+    lastCanRxPrintMs = millis();
+    Serial.print("CAN RX count=");
+    Serial.print(canRxCount);
+
+    if (haveLastCanRxFrame) {
+      Serial.print(" last: ");
+      printCanFrame(lastCanRxFrame);
+    } else {
+      Serial.println(" no frames yet");
     }
-
-    PC_SERIAL.println(">");
-    return true;
   }
-
-  if (!canReady) {
-    canTxFailCount++;
-
-    if (driveEnabled || motorRelayActive) {
-      canFaultLatched = true;
-    }
-
-    pcErr("CAN_NOT_READY");
-    return false;
-  }
-
-  CANFDMessage frame;
-  frame.idx = 0;
-  frame.id = makeVescCanId(packetId, vescId);
-  frame.ext = true;
-
-  // VESC expects classic CAN data frames, not CAN-FD payload frames.
-  frame.type = CANFDMessage::CAN_DATA;
-
-  frame.len = len;
-
-  for (uint8_t i = 0; i < 8; i++) {
-    frame.data[i] = 0;
-  }
-
-  for (uint8_t i = 0; i < len; i++) {
-    frame.data[i] = payload[i];
-  }
-
-  lastCanTxStatus = VESC_CAN.tryToSendReturnStatusFD(frame);
-
-  if (lastCanTxStatus != 0) {
-    canTxFailCount++;
-
-    if (driveEnabled || motorRelayActive) {
-      canFaultLatched = true;
-    }
-
-    unsigned long now = millis();
-
-    if (now - lastCanErrorPrintMs > 500) {
-      lastCanErrorPrintMs = now;
-
-      PC_SERIAL.print("<ERR,CAN_TX_FAIL,STATUS=0x");
-      PC_SERIAL.print(lastCanTxStatus, HEX);
-
-      PC_SERIAL.print(",FLAGS=0x");
-      PC_SERIAL.print(getCanFlags(), HEX);
-
-      PC_SERIAL.print(",ID=");
-      PC_SERIAL.print(vescId);
-
-      PC_SERIAL.print(",PACKET=");
-      PC_SERIAL.print(packetId);
-
-      PC_SERIAL.println(">");
-    }
-
-    return false;
-  }
-
-  return true;
 }
 
 bool sendVescDuty(uint8_t vescId, float duty) {
+  if (!canReady) {
+    canTxFail++;
+    lastCanTxStatus = 0xFFFFFFFF;
+    return false;
+  }
+
   duty = clampDuty(duty);
 
   uint8_t payload[4];
   int32_t scaledDuty = int32_t(lroundf(duty * 100000.0f));
   writeInt32BE(payload, scaledDuty);
 
-  return sendVescCanFrame(vescId, CAN_PACKET_SET_DUTY, payload, sizeof(payload));
-}
-
-void sendLeftCommand(float duty) {
-  if (DRY_RUN) {
-    PC_SERIAL.print("<DRY,L,DUTY=");
-    PC_SERIAL.print(duty, 3);
-    PC_SERIAL.println(">");
-    return;
-  }
-
-  sendVescDuty(LEFT_VESC_ID, duty);
-}
-
-void sendRightCommand(float duty) {
-  if (DRY_RUN) {
-    PC_SERIAL.print("<DRY,R,DUTY=");
-    PC_SERIAL.print(duty, 3);
-    PC_SERIAL.println(">");
-    return;
-  }
-
-  sendVescDuty(RIGHT_VESC_ID, duty);
-}
-
-void refreshVescCommandsBoth() {
-  sendVescDuty(LEFT_VESC_ID, leftTarget);
-  sendVescDuty(RIGHT_VESC_ID, rightTarget);
-}
-
-// --------------------------------------------------
-// CAN receive / telemetry
-// --------------------------------------------------
-
-void parseVescStatusFrame(const CANFDMessage& frame) {
-  if (!frame.ext) {
-    return;
-  }
-
-  const uint32_t packetId = getVescPacketIdFromCanId(frame.id);
-  const uint8_t sourceId = getVescSourceIdFromCanId(frame.id);
-
-  VescTelemetryCache* tel = nullptr;
-
-  if (sourceId == LEFT_VESC_ID) {
-    tel = &leftTel;
-  } else if (sourceId == RIGHT_VESC_ID) {
-    tel = &rightTel;
-  } else {
-    return;
-  }
-
-  canRxCount++;
-  tel->lastRxMs = millis();
-
-  if (packetId == CAN_PACKET_STATUS && frame.len >= 8) {
-    tel->seenStatus = true;
-    tel->rpm = readInt32BE(&frame.data[0]);
-    tel->current = float(readInt16BE(&frame.data[4])) / 10.0f;
-    tel->duty = float(readInt16BE(&frame.data[6])) / 1000.0f;
-    return;
-  }
-
-  if (packetId == CAN_PACKET_STATUS_5 && frame.len >= 6) {
-    tel->seenStatus5 = true;
-    tel->vin = float(readInt16BE(&frame.data[4])) / 10.0f;
-    return;
-  }
-}
-
-void readCan() {
-  if (DRY_RUN || !canReady) {
-    return;
-  }
-
   CANFDMessage frame;
+  frame.idx = 0;
+  frame.id = makeVescCanId(CAN_PACKET_SET_DUTY, vescId);
+  frame.ext = true;
+  frame.type = CANFDMessage::CAN_DATA;
+  frame.len = 4;
 
-  while (VESC_CAN.receiveFD0(frame)) {
-    parseVescStatusFrame(frame);
+  for (uint8_t i = 0; i < 8; i++) frame.data[i] = 0;
+  for (uint8_t i = 0; i < 4; i++) frame.data[i] = payload[i];
+
+  uint32_t status = VESC_CAN.tryToSendReturnStatusFD(frame);
+  lastCanTxStatus = status;
+
+  if (status == 0) {
+    canTxOk++;
+    return true;
   }
+
+  canTxFail++;
+
+  Serial.print("CAN TX FAIL to VESC ");
+  Serial.print(vescId);
+  Serial.print(" status=0x");
+  Serial.println(status, HEX);
+
+  return false;
 }
 
-// --------------------------------------------------
-// Status
-// --------------------------------------------------
-
-void printTelemetryStatus(const char* prefix, const VescTelemetryCache& tel) {
-  PC_SERIAL.print(",");
-  PC_SERIAL.print(prefix);
-  PC_SERIAL.print("_SEEN=");
-  PC_SERIAL.print(tel.seenStatus ? 1 : 0);
-
-  PC_SERIAL.print(",");
-  PC_SERIAL.print(prefix);
-  PC_SERIAL.print("_RPM=");
-  PC_SERIAL.print(tel.rpm);
-
-  PC_SERIAL.print(",");
-  PC_SERIAL.print(prefix);
-  PC_SERIAL.print("_CURR=");
-  PC_SERIAL.print(tel.current, 1);
-
-  PC_SERIAL.print(",");
-  PC_SERIAL.print(prefix);
-  PC_SERIAL.print("_DUTY_FB=");
-  PC_SERIAL.print(tel.duty, 3);
-
-  PC_SERIAL.print(",");
-  PC_SERIAL.print(prefix);
-  PC_SERIAL.print("_VIN=");
-  PC_SERIAL.print(tel.vin, 1);
-
-  PC_SERIAL.print(",");
-  PC_SERIAL.print(prefix);
-  PC_SERIAL.print("_AGE_MS=");
-  PC_SERIAL.print(tel.lastRxMs == 0 ? 0 : millis() - tel.lastRxMs);
+void sendBothMotors() {
+  sendVescDuty(LEFT_VESC_ID, leftDuty);
+  sendVescDuty(RIGHT_VESC_ID, rightDuty);
 }
 
-void sendStatusFrame() {
-  PC_SERIAL.print("<STAT,EN=");
-  PC_SERIAL.print(driveEnabled ? 1 : 0);
-
-  PC_SERIAL.print(",MODE_SET=");
-  PC_SERIAL.print(modeSelected ? 1 : 0);
-
-  PC_SERIAL.print(",MODE=");
-  PC_SERIAL.print(modeSelected ? drivingModeToString(drivingMode) : "NONE");
-
-  PC_SERIAL.print(",MOTION=");
-  PC_SERIAL.print(motionToString(motion));
-
-  PC_SERIAL.print(",L=");
-  PC_SERIAL.print(leftTarget, 3);
-
-  PC_SERIAL.print(",R=");
-  PC_SERIAL.print(rightTarget, 3);
-
-  PC_SERIAL.print(",L_ID=");
-  PC_SERIAL.print(LEFT_VESC_ID);
-
-  PC_SERIAL.print(",R_ID=");
-  PC_SERIAL.print(RIGHT_VESC_ID);
-
-  PC_SERIAL.print(",PENDING=");
-  PC_SERIAL.print(transitionPending ? 1 : 0);
-
-  PC_SERIAL.print(",TIMEOUT=");
-  PC_SERIAL.print(timeoutLatched ? 1 : 0);
-
-  PC_SERIAL.print(",ESTOP=");
-  PC_SERIAL.print(emergencyLatched ? 1 : 0);
-
-  PC_SERIAL.print(",RELAY=");
-  PC_SERIAL.print(motorRelayActive ? 1 : 0);
-
-  PC_SERIAL.print(",CAN_READY=");
-  PC_SERIAL.print(canReady ? 1 : 0);
-
-  PC_SERIAL.print(",CAN_FAULT=");
-  PC_SERIAL.print(canFaultLatched ? 1 : 0);
-
-  PC_SERIAL.print(",CAN_BITRATE=");
-  PC_SERIAL.print(CAN_BITRATE);
-
-  PC_SERIAL.print(",CAN_TX_FAILS=");
-  PC_SERIAL.print(canTxFailCount);
-
-  PC_SERIAL.print(",CAN_LAST_TX_STATUS=0x");
-  PC_SERIAL.print(lastCanTxStatus, HEX);
-
-  PC_SERIAL.print(",CAN_FLAGS=0x");
-  PC_SERIAL.print(getCanFlags(), HEX);
-
-  PC_SERIAL.print(",CAN_RX=");
-  PC_SERIAL.print(canRxCount);
-
-  PC_SERIAL.print(",TIMEOUT_MS=");
-  PC_SERIAL.print(PC_TIMEOUT_MS);
-
-  PC_SERIAL.print(",EXPECTED_PERIOD_MS=");
-  PC_SERIAL.print(EXPECTED_PC_COMMAND_PERIOD_MS);
-
-  PC_SERIAL.print(",DRY=");
-  PC_SERIAL.print(DRY_RUN ? 1 : 0);
-
-  printTelemetryStatus("L", leftTel);
-  printTelemetryStatus("R", rightTel);
-
-  PC_SERIAL.println(">");
-}
-
-// --------------------------------------------------
-// Movement mapping
-// --------------------------------------------------
-
-bool getTargetsForMotion(MotionState wantedMotion, float &left, float &right) {
-  float driveDuty = getDriveDuty();
-  float reverseDuty = getReverseDuty();
-  float turnDuty = getTurnDuty();
-
-  switch (wantedMotion) {
-    case FORWARD:
-      left = driveDuty;
-      right = driveDuty;
-      return true;
-
-    case REVERSE:
-      left = -reverseDuty;
-      right = -reverseDuty;
-      return true;
-
-    case LEFT:
-      left = -turnDuty;
-      right = turnDuty;
-      return true;
-
-    case RIGHT:
-      left = turnDuty;
-      right = -turnDuty;
-      return true;
-
-    case STOPPED:
-      left = 0.0f;
-      right = 0.0f;
-      return true;
-
-    default:
-      left = 0.0f;
-      right = 0.0f;
-      return false;
-  }
-}
-
-// --------------------------------------------------
-// Motor state functions
-// --------------------------------------------------
-
-void rawStopMotors() {
-  leftTarget = 0.0f;
-  rightTarget = 0.0f;
-  motion = STOPPED;
-
-  sendLeftCommand(0.0f);
-  sendRightCommand(0.0f);
-
-  pcEvent("MOTORS_STOPPED");
-}
+// -------------------- Movement --------------------
 
 void stopMotors() {
-  transitionPending = false;
-  rawStopMotors();
+  driveEnabled = false;
+  leftDuty = 0.0f;
+  rightDuty = 0.0f;
+
+  // Send zero first, then disable relay.
+  sendBothMotors();
+  delay(5);
+  setRelay(false);
+
+  Serial.println("STOP");
 }
 
-void applyMotors(float left, float right, MotionState newMotion) {
-  leftTarget = left;
-  rightTarget = right;
-  motion = newMotion;
-
-  sendLeftCommand(leftTarget);
-  sendRightCommand(rightTarget);
-
-  PC_SERIAL.print("<EVT,MOTION=");
-  PC_SERIAL.print(motionToString(motion));
-  PC_SERIAL.print(",L=");
-  PC_SERIAL.print(leftTarget, 3);
-  PC_SERIAL.print(",R=");
-  PC_SERIAL.print(rightTarget, 3);
-  PC_SERIAL.println(">");
-}
-
-void requestMotion(float left, float right, MotionState newMotion) {
-  if (!driveEnabled) {
-    pcErr("DRIVE_NOT_ENABLED_INTERNAL");
-    return;
-  }
-
-  if (!modeSelected && newMotion != STOPPED) {
-    pcErr("MODE_NOT_SELECTED_INTERNAL");
-    return;
-  }
-
-  if (!DRY_RUN && !canReady) {
-    pcErr("CAN_NOT_READY_MOTION_BLOCKED");
-    return;
-  }
-
-  if (canFaultLatched) {
-    pcErr("CAN_FAULT_LATCHED_MOTION_BLOCKED");
-    return;
-  }
-
-  if (transitionPending) {
-    pendingLeftTarget = left;
-    pendingRightTarget = right;
-    pendingMotion = newMotion;
-
-    PC_SERIAL.print("<EVT,PENDING_REPLACED,MOTION=");
-    PC_SERIAL.print(motionToString(pendingMotion));
-    PC_SERIAL.println(">");
-
-    return;
-  }
-
-  if (motion == STOPPED) {
-    applyMotors(left, right, newMotion);
-    return;
-  }
-
-  if (motion == newMotion) {
-    applyMotors(left, right, newMotion);
-    return;
-  }
-
-  PC_SERIAL.print("<EVT,MOTION_CHANGE,FROM=");
-  PC_SERIAL.print(motionToString(motion));
-  PC_SERIAL.print(",TO=");
-  PC_SERIAL.print(motionToString(newMotion));
-  PC_SERIAL.println(">");
-
-  rawStopMotors();
-
-  pendingLeftTarget = left;
-  pendingRightTarget = right;
-  pendingMotion = newMotion;
-
-  transitionPending = true;
-  transitionStartMs = millis();
-}
-
-void requestMotionState(MotionState wantedMotion) {
-  float left = 0.0f;
-  float right = 0.0f;
-
-  if (!getTargetsForMotion(wantedMotion, left, right)) {
-    pcErr("INVALID_MOTION");
-    return;
-  }
-
-  requestMotion(left, right, wantedMotion);
-}
-
-void processPendingTransition() {
-  if (!transitionPending) {
-    return;
-  }
-
-  if (!driveEnabled) {
-    transitionPending = false;
-    return;
-  }
-
-  if (millis() - transitionStartMs >= STOP_BEFORE_CHANGE_MS) {
-    transitionPending = false;
-    applyMotors(pendingLeftTarget, pendingRightTarget, pendingMotion);
-  }
-}
-
-// --------------------------------------------------
-// Internal drive control
-// --------------------------------------------------
-
-bool internalEnableDrive() {
-  if (!DRY_RUN && !canReady) {
-    pcErr("CAN_NOT_READY_ENABLE_BLOCKED");
-    return false;
-  }
-
-  if (canFaultLatched) {
-    pcErr("CAN_FAULT_LATCHED_ENABLE_BLOCKED");
-    return false;
-  }
-
+void moveMotors(float left, float right) {
   driveEnabled = true;
-  modeSelected = true;
-  timeoutLatched = false;
-  emergencyLatched = false;
+  leftDuty = left;
+  rightDuty = right;
+  lastCommandMs = millis();
 
-  setMotorRelay(true);
-  markValidMovementCommand();
+  setRelay(true);
+  sendBothMotors();
 
-  return true;
+  Serial.print("MOVE L=");
+  Serial.print(leftDuty, 3);
+  Serial.print(" R=");
+  Serial.println(rightDuty, 3);
 }
 
-void internalDisableDrive(const char* reason) {
-  transitionPending = false;
+void printStatus() {
+  Serial.print("enabled=");
+  Serial.print(driveEnabled ? 1 : 0);
 
-  // Safety order:
-  // 1. Drop relay/brakes first.
-  // 2. Then try to send zero duty.
-  driveEnabled = false;
-  modeSelected = false;
-  setMotorRelay(false);
+  Serial.print(" leftDuty=");
+  Serial.print(leftDuty, 3);
 
-  stopMotors();
+  Serial.print(" rightDuty=");
+  Serial.print(rightDuty, 3);
 
-  PC_SERIAL.print("<EVT,DRIVE_DISABLED,REASON=");
-  PC_SERIAL.print(reason);
-  PC_SERIAL.println(">");
-}
+  Serial.print(" canReady=");
+  Serial.print(canReady ? 1 : 0);
 
-void forceDisableDriveNoCanStop(const char* reason) {
-  transitionPending = false;
+  Serial.print(" canError=0x");
+  Serial.print(canErrorCode, HEX);
 
-  leftTarget = 0.0f;
-  rightTarget = 0.0f;
-  motion = STOPPED;
+  Serial.print(" ramNeeded=");
+  Serial.print(canRamNeeded);
 
-  driveEnabled = false;
-  modeSelected = false;
+  Serial.print(" canRxCount=");
+  Serial.print(canRxCount);
 
-  setMotorRelay(false);
+  Serial.print(" txOk=");
+  Serial.print(canTxOk);
 
-  PC_SERIAL.print("<WARN,DRIVE_FORCE_DISABLED,REASON=");
-  PC_SERIAL.print(reason);
-  PC_SERIAL.println(">");
-}
+  Serial.print(" txFail=");
+  Serial.print(canTxFail);
 
-void setDrivingModeInternal(DrivingMode newMode) {
-  drivingMode = newMode;
-  modeSelected = true;
+  Serial.print(" lastTxStatus=0x");
+  Serial.println(lastCanTxStatus, HEX);
 
-  PC_SERIAL.print("<EVT,MODE=");
-  PC_SERIAL.print(drivingModeToString(drivingMode));
-  PC_SERIAL.print(",BASE_DUTY=");
-  PC_SERIAL.print(getDriveDuty(), 3);
-  PC_SERIAL.println(">");
-}
-
-void handleCanFaultShutdown() {
-  if (!canFaultLatched) {
-    return;
-  }
-
-  if (driveEnabled || motorRelayActive) {
-    forceDisableDriveNoCanStop("CAN_TX_FAULT");
+  if (haveLastCanRxFrame) {
+    Serial.print("last ");
+    printCanFrame(lastCanRxFrame);
   }
 }
 
-// --------------------------------------------------
-// Binary PC command handler
-// --------------------------------------------------
+// -------------------- PC command handling --------------------
 
-void handleBinaryCommand(uint8_t rawByte) {
-  // Only accept values 0 to 7.
-  // This prevents normal ASCII text from being treated as motion commands.
-  if (rawByte > 0x07) {
-    return;
-  }
+uint8_t normalizeCommand(uint8_t b) {
+  // Raw byte commands 0x00..0x07.
+  if (b <= 7) return b;
 
-  uint8_t cmd = rawByte & 0x07;
+  // ASCII commands from Serial Monitor/Python input: '0'..'7'.
+  if (b >= '0' && b <= '7') return b - '0';
+
+  return 255;
+}
+
+void handleCommand(uint8_t rawByte) {
+  uint8_t cmd = normalizeCommand(rawByte);
+  if (cmd == 255) return;
 
   switch (cmd) {
-    case CMD_STOP:
-      timeoutLatched = false;
-      emergencyLatched = false;
-      canFaultLatched = false;
-      internalDisableDrive("BIN_STOP");
-      pcAck("BIN,STOP");
-      return;
-
-    case CMD_MODE_1:
-      setDrivingModeInternal(MODE_1);
-      if (!internalEnableDrive()) {
-        return;
-      }
-      requestMotionState(FORWARD);
-      pcAck("BIN,MODE1_FORWARD");
-      return;
-
-    case CMD_MODE_2:
-      setDrivingModeInternal(MODE_2);
-      if (!internalEnableDrive()) {
-        return;
-      }
-      requestMotionState(FORWARD);
-      pcAck("BIN,MODE2_FORWARD");
-      return;
-
-    case CMD_MODE_3:
-      setDrivingModeInternal(MODE_3);
-      if (!internalEnableDrive()) {
-        return;
-      }
-      requestMotionState(FORWARD);
-      pcAck("BIN,MODE3_FORWARD");
-      return;
-
-    case CMD_RIGHT:
-      if (!modeSelected) {
-        setDrivingModeInternal(MODE_1);
-      }
-
-      if (!internalEnableDrive()) {
-        return;
-      }
-
-      requestMotionState(RIGHT);
-      pcAck("BIN,RIGHT");
-      return;
-
-    case CMD_LEFT:
-      if (!modeSelected) {
-        setDrivingModeInternal(MODE_1);
-      }
-
-      if (!internalEnableDrive()) {
-        return;
-      }
-
-      requestMotionState(LEFT);
-      pcAck("BIN,LEFT");
-      return;
-
-    case CMD_STATUS:
-      sendStatusFrame();
-      return;
-
-    case CMD_ESTOP:
-      transitionPending = false;
-
-      // ESTOP safety order:
-      // Drop relay first, then try zero-duty CAN.
-      driveEnabled = false;
-      modeSelected = false;
-      timeoutLatched = false;
-      emergencyLatched = true;
-      canFaultLatched = false;
-
-      setMotorRelay(false);
+    case 0:
       stopMotors();
+      break;
 
-      pcWarn("BIN_ESTOP");
-      pcAck("BIN,ESTOP");
-      return;
+    case 1:
+      moveMotors(DUTY_SLOW, DUTY_SLOW);
+      break;
 
-    default:
-      pcErr("BIN_UNKNOWN");
-      return;
+    case 2:
+      moveMotors(DUTY_MED, DUTY_MED);
+      break;
+
+    case 3:
+      moveMotors(DUTY_FAST, DUTY_FAST);
+      break;
+
+    case 4:
+      // Right turn. If direction is wrong, swap signs.
+      moveMotors(DUTY_TURN, -DUTY_TURN);
+      break;
+
+    case 5:
+      // Left turn. If direction is wrong, swap signs.
+      moveMotors(-DUTY_TURN, DUTY_TURN);
+      break;
+
+    case 6:
+      printStatus();
+      break;
+
+    case 7:
+      stopMotors();
+      Serial.println("EMERGENCY STOP");
+      break;
   }
 }
 
-// --------------------------------------------------
-// Serial receiving
-// --------------------------------------------------
-
-void readPcSerial() {
-  while (PC_SERIAL.available() > 0) {
-    uint8_t rawByte = uint8_t(PC_SERIAL.read());
-    handleBinaryCommand(rawByte);
-  }
-}
-
-// --------------------------------------------------
-// PC timeout
-// --------------------------------------------------
-
-void checkPcTimeout() {
-  if (!driveEnabled) {
-    return;
-  }
-
-  unsigned long now = millis();
-
-  if (now - lastValidMovementCommandMs > PC_TIMEOUT_MS) {
-    transitionPending = false;
-
-    // Safety order:
-    // Drop relay/brakes first, then try zero-duty CAN.
-    driveEnabled = false;
-    modeSelected = false;
-    timeoutLatched = true;
-
-    setMotorRelay(false);
-    stopMotors();
-
-    pcWarn("PC_TIMEOUT_500MS");
-    pcEvent("DRIVE_DISABLED_AFTER_TIMEOUT");
-  }
-}
-
-// --------------------------------------------------
-// Setup and loop
-// --------------------------------------------------
+// -------------------- Arduino setup/loop --------------------
 
 void setup() {
-  PC_SERIAL.begin(115200);
-  while (!PC_SERIAL) {;}
+  Serial.begin(115200);
+  while (!Serial) {}
 
-  setupMotorRelay();
+  pinMode(MOTOR_RELAY_PIN, OUTPUT);
+  setRelay(false);
 
   canReady = setupCan();
 
-  lastValidMovementCommandMs = millis();
+  stopMotors();
 
-  PC_SERIAL.println();
-  PC_SERIAL.println("<BOOT,CHAIR_CAN_RAW_BYTE_TEST_READY>");
-  PC_SERIAL.println("<BOOT,THIS_USES_SAME_RAW_BYTE_LOGIC_AS_UART>");
-  PC_SERIAL.println("<BOOT,0x00=STOP>");
-  PC_SERIAL.println("<BOOT,0x01=MODE1_FORWARD>");
-  PC_SERIAL.println("<BOOT,0x02=MODE2_FORWARD>");
-  PC_SERIAL.println("<BOOT,0x03=MODE3_FORWARD>");
-  PC_SERIAL.println("<BOOT,0x04=RIGHT>");
-  PC_SERIAL.println("<BOOT,0x05=LEFT>");
-  PC_SERIAL.println("<BOOT,0x06=STATUS>");
-  PC_SERIAL.println("<BOOT,0x07=ESTOP>");
-
-  PC_SERIAL.print("<BOOT,LEFT_VESC_ID=");
-  PC_SERIAL.print(LEFT_VESC_ID);
-  PC_SERIAL.println(">");
-
-  PC_SERIAL.print("<BOOT,RIGHT_VESC_ID=");
-  PC_SERIAL.print(RIGHT_VESC_ID);
-  PC_SERIAL.println(">");
-
-  PC_SERIAL.print("<BOOT,CAN_BITRATE=");
-  PC_SERIAL.print(CAN_BITRATE);
-  PC_SERIAL.println(">");
-
-  PC_SERIAL.println("<BOOT,CAN_PERIPHERAL=FDCAN2>");
-  PC_SERIAL.println("<BOOT,CAN_TX_PIN=PB13>");
-  PC_SERIAL.println("<BOOT,CAN_RX_PIN=PB5>");
-
-  PC_SERIAL.print("<BOOT,CAN_STBY_PIN=D");
-  PC_SERIAL.print(CAN_STBY_PIN);
-  PC_SERIAL.println(">");
-
-  PC_SERIAL.print("<BOOT,EXPECTED_COMMAND_PERIOD_MS=");
-  PC_SERIAL.print(EXPECTED_PC_COMMAND_PERIOD_MS);
-  PC_SERIAL.println(">");
-
-  PC_SERIAL.print("<BOOT,TIMEOUT_MS=");
-  PC_SERIAL.print(PC_TIMEOUT_MS);
-  PC_SERIAL.println(">");
-
-  PC_SERIAL.print("<BOOT,TEST_DUTY_MODE1=");
-  PC_SERIAL.print(DUTY_MODE_1, 3);
-  PC_SERIAL.println(">");
-
-  PC_SERIAL.print("<BOOT,TEST_DUTY_MODE2=");
-  PC_SERIAL.print(DUTY_MODE_2, 3);
-  PC_SERIAL.println(">");
-
-  PC_SERIAL.print("<BOOT,TEST_DUTY_MODE3=");
-  PC_SERIAL.print(DUTY_MODE_3, 3);
-  PC_SERIAL.println(">");
-
-  PC_SERIAL.print("<BOOT,DRY_RUN=");
-  PC_SERIAL.print(DRY_RUN ? 1 : 0);
-  PC_SERIAL.println(">");
-
-  if (!canReady && !DRY_RUN) {
-    pcWarn("CAN_NOT_READY_OUTPUT_DISABLED");
-  }
-
-  rawStopMotors();
-  setMotorRelay(false);
-  sendStatusFrame();
+  Serial.println("Ready");
+  Serial.println("Commands: 1 slow | 2 medium | 3 fast | 4 right | 5 left | 0 stop | 6 status | 7 estop");
 }
 
 void loop() {
-  readPcSerial();
-
-  readCan();
-
-  processPendingTransition();
-
-  checkPcTimeout();
-
-  if (driveEnabled && (millis() - lastKeepAliveMs > KEEPALIVE_MS)) {
-    lastKeepAliveMs = millis();
-    refreshVescCommandsBoth();
+  while (Serial.available() > 0) {
+    handleCommand(uint8_t(Serial.read()));
   }
 
-  handleCanFaultShutdown();
+  readCanFrames();
+
+  if (driveEnabled && millis() - lastCommandMs > COMMAND_TIMEOUT_MS) {
+    Serial.println("TIMEOUT");
+    stopMotors();
+  }
+
+  if (driveEnabled && millis() - lastSendMs > SEND_EVERY_MS) {
+    lastSendMs = millis();
+    sendBothMotors();
+  }
 }
