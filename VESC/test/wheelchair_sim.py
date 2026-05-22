@@ -41,7 +41,7 @@ class WheelchairParams:
 
     # Mass
     chair_mass_kg: float = 70.0             # TODO: chair mass [kg]
-    rider_mass_kg: float = 70.0             # TODO: rider/test load mass [kg]
+    rider_mass_kg: float = 70.0
 
     # Drivetrain
     gear_ratio: float = 10.0                # TODO: motor revs per wheel rev

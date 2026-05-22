@@ -23,6 +23,16 @@ const unsigned long WATCHDOG_TIMEOUT = 500; // ms
 
 VescUart VescContr;
 
+constexpr uint8_t STARTUP_GREEN_LED_PIN = 47;
+constexpr unsigned long STARTUP_GREEN_LED_MS = 5000;
+
+void showStartupGreenLight() {
+  pinMode(STARTUP_GREEN_LED_PIN, OUTPUT);
+  digitalWrite(STARTUP_GREEN_LED_PIN, HIGH);
+  delay(STARTUP_GREEN_LED_MS);
+  digitalWrite(STARTUP_GREEN_LED_PIN, LOW);
+}
+
 void updateMotors(float v, float w) {
   VescContr.setRPM((int)v);
   delay(1000);
@@ -39,6 +49,8 @@ void sendKeepaliveBoth() {
 }
 
 void setup() {
+  showStartupGreenLight();
+
   // Giga Native USB Serial
   Serial.begin(115200);
   Serial1.begin(115200);
