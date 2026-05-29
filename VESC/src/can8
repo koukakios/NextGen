@@ -1,10 +1,6 @@
 #include <Arduino.h>
 #include <math.h>
 
-#ifndef ARDUINO_GIGA
-#error This code is for Arduino GIGA R1 WiFi.
-#endif
-
 static const uint32_t FDCAN1_MESSAGE_RAM_WORD_SIZE = 0;
 static const uint32_t FDCAN2_MESSAGE_RAM_WORD_SIZE = 2560;
 
@@ -27,15 +23,13 @@ constexpr float DUTY_MED  = 0.20f;
 constexpr float DUTY_FAST = 0.30f;
 constexpr float DUTY_TURN = 0.40f;
 
-constexpr unsigned long MOTOR_TIMEOUT_MS = 500;
-constexpr unsigned long RELAY_TIMEOUT_MS = 2000;
+constexpr unsigned long COMMAND_TIMEOUT_MS = 500;
 constexpr unsigned long SEND_EVERY_MS = 20;
 
 constexpr uint32_t CAN_PACKET_SET_DUTY = 0;
 
 bool canReady = false;
 bool driveEnabled = false;
-bool relayEnabled = false;
 
 float leftDuty = 0.0f;
 float rightDuty = 0.0f;
@@ -61,7 +55,6 @@ uint32_t makeVescCanId(uint32_t packetId, uint8_t vescId) {
 }
 
 void setRelay(bool on) {
-  relayEnabled = on;
   digitalWrite(MOTOR_RELAY_PIN, on ? RELAY_ON : RELAY_OFF);
 }
 
@@ -123,29 +116,18 @@ bool sendVescDuty(uint8_t vescId, float duty) {
 }
 
 void sendBothMotors() {
-  sendVescDuty(LEFT_VESC_ID, leftDuty);
+  sendVescDuty(LEFT_VESC_ID, -leftDuty);
   sendVescDuty(RIGHT_VESC_ID, rightDuty);
 }
 
-/*
-  This only stops the VESC motor command.
-  It does NOT turn off the relay.
-*/
-void stopMotorCommand() {
+void stopMotors() {
   driveEnabled = false;
   leftDuty = 0.0f;
   rightDuty = 0.0f;
 
   sendBothMotors();
-}
-
-/*
-  This fully disables the relay.
-  This is only called after 2 seconds without command.
-*/
-void turnOffRelayAfterTimeout() {
-  stopMotorCommand();
   delay(5);
+
   setRelay(false);
 }
 
@@ -153,6 +135,7 @@ void moveMotors(float left, float right) {
   driveEnabled = true;
   leftDuty = left;
   rightDuty = right;
+  lastCommandMs = millis();
 
   setRelay(true);
   delay(100);
@@ -161,9 +144,9 @@ void moveMotors(float left, float right) {
 }
 
 uint8_t normalizeCommand(uint8_t b) {
-  if (b <= 5) return b;
+  if (b <= 7) return b;
 
-  if (b >= '0' && b <= '5') {
+  if (b >= '0' && b <= '7') {
     return b - '0';
   }
 
@@ -174,31 +157,36 @@ void handleCommand(uint8_t rawByte) {
   uint8_t cmd = normalizeCommand(rawByte);
   if (cmd == 255) return;
 
-  lastCommandMs = millis();
-
   switch (cmd) {
     case 0:
-      stopMotorCommand();
+      stopMotors();
       break;
 
     case 1:
-      moveMotors(DUTY_SLOW, -DUTY_SLOW);
+      moveMotors(DUTY_SLOW, DUTY_SLOW);
       break;
 
     case 2:
-      moveMotors(DUTY_MED, -DUTY_MED);
+      moveMotors(DUTY_MED, DUTY_MED);
       break;
 
     case 3:
-      moveMotors(DUTY_FAST, -DUTY_FAST);
+      moveMotors(DUTY_FAST, DUTY_FAST);
       break;
 
     case 4:
-      moveMotors(-DUTY_TURN, -DUTY_TURN);
+      moveMotors(DUTY_TURN, -DUTY_TURN);
       break;
 
     case 5:
-      moveMotors(DUTY_TURN, DUTY_TURN);
+      moveMotors(-DUTY_TURN, DUTY_TURN);
+      break;
+
+    case 6:
+      break;
+
+    case 7:
+      stopMotors();
       break;
   }
 }
@@ -210,7 +198,7 @@ void setup() {
 
   canReady = setupCan();
 
-  stopMotorCommand();
+  stopMotors();
 }
 
 void loop() {
@@ -218,29 +206,12 @@ void loop() {
     handleCommand(uint8_t(Serial.read()));
   }
 
-  unsigned long now = millis();
-
-  /*
-    If commands stop for 500 ms, stop the motors.
-    The relay stays on.
-  */
-  if (driveEnabled && now - lastCommandMs > MOTOR_TIMEOUT_MS) {
-    stopMotorCommand();
+  if (driveEnabled && millis() - lastCommandMs > COMMAND_TIMEOUT_MS) {
+    stopMotors();
   }
 
-  /*
-    If no valid command is received for 2 seconds,
-    then the relay is turned off.
-  */
-  if (relayEnabled && now - lastCommandMs > RELAY_TIMEOUT_MS) {
-    turnOffRelayAfterTimeout();
-  }
-
-  /*
-    While driving, keep sending the current duty command to the VESCs.
-  */
-  if (driveEnabled && now - lastSendMs > SEND_EVERY_MS) {
-    lastSendMs = now;
+  if (driveEnabled && millis() - lastSendMs > SEND_EVERY_MS) {
+    lastSendMs = millis();
     sendBothMotors();
   }
 }
