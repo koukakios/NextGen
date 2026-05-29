@@ -35,11 +35,11 @@ class Camera:
         margin = face_width * self.deadzone_ratio
 
         if nose_x < (face_center_x - margin):
-            self.state = "LEFT"
-            return "LEFT", (255, 0, 0)  # Μπλε
-        elif nose_x > (face_center_x + margin):
             self.state = "RIGHT"
-            return "RIGHT", (0, 0, 255)  # Κόκκινο
+            return "RIGHT", (255, 0, 0)  # Μπλε
+        elif nose_x > (face_center_x + margin):
+            self.state = "LEFT"
+            return "LEFT", (0, 0, 255)  # Κόκκινο
         else:
             self.state = "MIDDLE"
             return "MIDDLE", (0, 255, 0)  # Πράσινο
