@@ -1,5 +1,6 @@
 #include <Arduino.h>
 #include <math.h>
+#include <ArduinoBLE.h>
 
 #ifndef ARDUINO_GIGA
 #error This code is for Arduino GIGA R1 WiFi.
@@ -32,6 +33,12 @@ constexpr unsigned long RELAY_TIMEOUT_MS = 2000;
 constexpr unsigned long SEND_EVERY_MS = 20;
 
 constexpr uint32_t CAN_PACKET_SET_DUTY = 0;
+
+const char* SERVICE_UUID = "4fafc201-1fb5-459e-8fcc-c5c9c331914b";
+const char* CMD_UUID     = "beb5483e-36e1-4688-b7f5-ea07361b26a8";
+
+BLEService vescService(SERVICE_UUID);
+BLEStringCharacteristic cmdChar(CMD_UUID, BLERead | BLEWrite | BLENotify, 20);
 
 bool canReady = false;
 bool driveEnabled = false;
@@ -203,10 +210,40 @@ void handleCommand(uint8_t rawByte) {
   }
 }
 
-void setup() {
-  Serial.begin(115200);
 
+void setupBle() {
+  if (!BLE.begin()) {
+    while (1);
+  }
+
+  BLE.setLocalName("GIGA Data Sender");
+  BLE.setDeviceName("GIGA Data Sender");
+  BLE.setAdvertisedService(vescService);
+
+  vescService.addCharacteristic(cmdChar);
+  BLE.addService(vescService);
+
+  cmdChar.writeValue("READY");
+  BLE.advertise();
+}
+
+void handleBleCommands() {
+  BLE.poll();
+
+  if (!cmdChar.written()) return;
+
+  String s = cmdChar.value();
+
+  for (uint8_t i = 0; i < s.length(); i++) {
+    handleCommand(uint8_t(s[i]));
+  }
+
+  cmdChar.writeValue("OK");
+}
+
+void setup() {
   setupRelay();
+  setupBle();
 
   canReady = setupCan();
 
@@ -214,9 +251,7 @@ void setup() {
 }
 
 void loop() {
-  while (Serial.available() > 0) {
-    handleCommand(uint8_t(Serial.read()));
-  }
+  handleBleCommands();
 
   unsigned long now = millis();
 
