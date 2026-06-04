@@ -24,7 +24,7 @@ from utils.Config import DNN_PROTO, DNN_MODEL, LBF_MODEL
 from utils.Config import deadzone_ratio, cam_index
 
 # --- CHANGED: Serial configuration updated for single port ---
-PORT = '/dev/cu.usbmodem101'
+PORT = '/dev/cu.usbmodem101' #port of the arduino with the EMG and Mic 
 BAUD = 1_000_000
 
 # --- ADDED: Bluetooth BLE Configuration ---
