@@ -6,6 +6,8 @@ import threading
 import queue 
 import subprocess
 from contextlib import ExitStack
+import asyncio
+from bleak import BleakClient
 
 def run_parallel_script(script_name):
     subprocess.run(["python", script_name])
@@ -21,9 +23,15 @@ from classes.camera_class import Camera
 from utils.Config import DNN_PROTO, DNN_MODEL, LBF_MODEL
 from utils.Config import deadzone_ratio, cam_index
 
+# --- CHANGED: Serial configuration updated for single port ---
 PORT = '/dev/cu.usbmodem101'
-PORT2 = '/dev/cu.usbmodem1101'
 BAUD = 1_000_000
+
+# --- ADDED: Bluetooth BLE Configuration ---
+# Note: macOS uses UUID strings for addresses. Windows/Linux use standard MAC addresses.
+BLE_ADDRESS = "4fafc201-1fb5-459e-8fcc-c5c9c331914b"
+BLE_CHAR_UUID = "beb5483e-36e1-4688-b7f5-ea07361b26a8" # The RX characteristic of your receiving board
+
 
 # --- Dedicated Mic Worker Thread ---
 def mic_processing_thread(mic_obj, data_queue):
@@ -34,10 +42,8 @@ def mic_processing_thread(mic_obj, data_queue):
             break
             
         try:
-            # The safety net!
             mic_obj.update_mic(mic_data)
         except Exception as e:
-            # If the AI model fails, print the exact error to the terminal
             print(f"\n[MIC THREAD ERROR]: {e}")
             
         data_queue.task_done()
@@ -46,13 +52,31 @@ def mic_processing_thread(mic_obj, data_queue):
 def camera_processing_thread(cam_obj):
     """Continuously processes OpenCV video frames in the background."""
     while True:
-        # This handles the heavy OpenCV/DNN frame processing
-        # It updates cam_obj.state automatically without blocking the main loop
         cam_obj.update_state()
-        
-        # A tiny sleep here is okay because it only slows down the camera thread, 
-        # NOT the main Serial transmission loop.
         time.sleep(0.01) 
+
+# --- ADDED: Dedicated Bluetooth Worker Thread ---
+def bluetooth_processing_thread(bt_queue, address, char_uuid):
+    """Handles asynchronous BLE communication in a separate thread."""
+    async def run_ble():
+        print(f"[BLUETOOTH] Attempting connection to {address}...")
+        try:
+            async with BleakClient(address) as client:
+                print(f"\n[BLUETOOTH] Connected to Auxiliary Output!")
+                while True:
+                    if not bt_queue.empty():
+                        byte_data = bt_queue.get_nowait()
+                        # Sending without waiting for an ACK reduces latency for motor control
+                        await client.write_gatt_char(char_uuid, byte_data, response=False)
+                        bt_queue.task_done()
+                    
+                    # Yield control to the event loop so it doesn't lock up
+                    await asyncio.sleep(0.005) 
+        except Exception as e:
+            print(f"\n[BLUETOOTH THREAD ERROR]: {e}")
+
+    # Run the async loop inside this dedicated thread
+    asyncio.run(run_ble())
 # ------------------------------------------
 
 if __name__ == "__main__":
@@ -80,35 +104,37 @@ if __name__ == "__main__":
         deadzone_ratio=deadzone_ratio
     )
 
-    # Start Camera Thread
     cam_thread = threading.Thread(target=camera_processing_thread, args=(my_cam,), daemon=True)
     cam_thread.start()
+
+    # --- ADDED: Initialize Bluetooth Thread ---
+    bt_queue = queue.Queue(maxsize=10)
+    bt_thread = threading.Thread(target=bluetooth_processing_thread, args=(bt_queue, BLE_ADDRESS, BLE_CHAR_UUID), daemon=True)
+    bt_thread.start()
     # ---------------------------------------------
 
-    print(f"Connecting to Arduinos on:\n -> Main Input/Output: {PORT}\n -> Auxiliary Output: {PORT2}...")
+    print(f"Connecting to Main Input/Output on: {PORT}...")
 
     uart = 0b000  
     last_sent_time = time.time()
     last_sent_uart = None
 
     try:
-        # ExitStack manages opening both serial ports simultaneously and ensures both close on exit
+        # --- CHANGED: ExitStack now only manages the single primary serial port ---
         with ExitStack() as stack:
             ser = stack.enter_context(serial.Serial(PORT, BAUD, timeout=0))
-            ser2 = stack.enter_context(serial.Serial(PORT2, BAUD, timeout=0))
             
             ser.reset_input_buffer()
-            ser2.reset_output_buffer()
-            time.sleep(2)  # Shared bootloader stability pause
+            time.sleep(2)  
 
             print("\nSystem Ready! Listening for sensor data... (Press Ctrl+C to stop)")
             print("-" * 50)
 
             while True:
-                # 1. Grab all available packets (Must be as fast as possible from master port)
+                # 1. Grab all available packets 
                 latest_emg_list, latest_mic_list = get_latest_data(ser)
 
-                # 2. Update Mic (Hand off to background thread)
+                # 2. Update Mic 
                 if latest_mic_list:
                     try:
                         mic_queue.put_nowait(latest_mic_list)
@@ -119,27 +145,27 @@ if __name__ == "__main__":
                 if latest_emg_list and my_mic.mic_state:
                     my_emg.update_mode(latest_emg_list)
 
-                # 5. Calculate Motor Logic 
+                # 4. Calculate Motor Logic 
                 turning_mode = my_emg.turning_mode
-            
                 uart = signal_to_motor(my_mic.mic_state, my_emg.mode, my_cam.state, turning_mode, uart)
 
-                # 6. "Smart Timer" Logic for sending data to BOTH controllers
+                # 5. "Smart Timer" Logic for sending data to BLE
                 current_time = time.time()
                 if (current_time - last_sent_time >= 0.1) or (uart != last_sent_uart):
                     byte_data = uart.to_bytes(1, 'big')
                     
-                    # Send transmission to both endpoints simultaneously
-                    ser2.write(byte_data)
+                    # --- CHANGED: Push byte to Bluetooth queue instead of serial write ---
+                    try:
+                        bt_queue.put_nowait(byte_data)
+                    except queue.Full:
+                        pass # Drop packet if BLE is lagging, prioritizing newest data
                     
                     last_sent_time = current_time
                     last_sent_uart = uart
 
-                # 7. UI Update for the console (Clean, single-line update)
+                # 6. UI Update 
                 if latest_emg_list and not my_emg.is_collecting:
                     print(f"EMG Gear: {my_emg.mode} | Mic: {my_mic.mic_state} | Cam: {my_cam.state}", end='\r')
-
-                # REMOVED: time.sleep(0.01) from main loop so the Serial buffer never overflows.
             
     except KeyboardInterrupt:
-        print("\n\nProgram stopped safely. Both serial ports closed cleanly.")
+        print("\n\nProgram stopped safely. Serial port closed cleanly.")
