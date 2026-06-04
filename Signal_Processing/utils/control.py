@@ -29,7 +29,7 @@ BAUD = 1_000_000
 
 # --- ADDED: Bluetooth BLE Configuration ---
 # Note: macOS uses UUID strings for addresses. Windows/Linux use standard MAC addresses.
-BLE_ADDRESS = "4fafc201-1fb5-459e-8fcc-c5c9c331914b"
+BLE_ADDRESS = "B49BD427-B606-4B44-2EDD-B0FD91BF8C58"
 BLE_CHAR_UUID = "beb5483e-36e1-4688-b7f5-ea07361b26a8" # The RX characteristic of your receiving board
 
 
@@ -59,21 +59,31 @@ def camera_processing_thread(cam_obj):
 def bluetooth_processing_thread(bt_queue, address, char_uuid):
     """Handles asynchronous BLE communication in a separate thread."""
     async def run_ble():
-        print(f"[BLUETOOTH] Attempting connection to {address}...")
-        try:
-            async with BleakClient(address) as client:
-                print(f"\n[BLUETOOTH] Connected to Auxiliary Output!")
-                while True:
-                    if not bt_queue.empty():
-                        byte_data = bt_queue.get_nowait()
-                        # Sending without waiting for an ACK reduces latency for motor control
-                        await client.write_gatt_char(char_uuid, byte_data, response=False)
-                        bt_queue.task_done()
+        while True: # ADDED: Outer loop to keep trying if connection drops
+            print(f"[BLUETOOTH] Attempting connection to {address}...")
+            try:
+                # The timeout helps prevent it from hanging indefinitely on a bad connection
+                async with BleakClient(address, timeout=10.0) as client:
+                    print(f"\n[BLUETOOTH] Connected to Auxiliary Output!")
                     
-                    # Yield control to the event loop so it doesn't lock up
-                    await asyncio.sleep(0.005) 
-        except Exception as e:
-            print(f"\n[BLUETOOTH THREAD ERROR]: {e}")
+                    # ADDED: Loop only while the connection is actively alive
+                    while client.is_connected:
+                        if not bt_queue.empty():
+                            byte_data = bt_queue.get_nowait()
+                            
+                            # CHANGED: Let Bleak auto-detect the correct write property (response True/False)
+                            await client.write_gatt_char(char_uuid, byte_data)
+                            bt_queue.task_done()
+                        
+                        # Yield control to the event loop
+                        await asyncio.sleep(0.01) 
+                        
+            except Exception as e:
+                print(f"\n[BLUETOOTH ERROR]: {e}")
+            
+            # If it breaks out of the 'async with', the connection died. 
+            print("[BLUETOOTH] Disconnected. Retrying in 2 seconds...")
+            await asyncio.sleep(2)
 
     # Run the async loop inside this dedicated thread
     asyncio.run(run_ble())
