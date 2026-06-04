@@ -1,8 +1,10 @@
 import serial
 import struct
+
 mic_state = False
 
 def signal_mic_change(mic_word):
+    global mic_state  # ADDED: This tells Python to modify the variable at the top of the file
     if mic_word == 'on':
         mic_state = True
     elif mic_word == 'off':
@@ -10,7 +12,7 @@ def signal_mic_change(mic_word):
     return
 
 
-def signal_to_motor(mic_state, emg_mode, turn_dir, turning_mode = False, uart_old = 0b000):
+def signal_to_motor(mic_state, emg_mode, turn_dir, turning_mode=False, uart_old=0b000):
     """
     Protocol: send 8 bits of data
     States:
@@ -21,6 +23,10 @@ def signal_to_motor(mic_state, emg_mode, turn_dir, turning_mode = False, uart_ol
     R - 100
     L - 101
     """
+    # ADDED: Define a safe fallback immediately. 
+    # If no conditions are met, it just keeps doing whatever it was already doing.
+    uart = uart_old 
+
     if mic_state:
         if turning_mode == False:
             uart = 0b000
@@ -33,24 +39,20 @@ def signal_to_motor(mic_state, emg_mode, turn_dir, turning_mode = False, uart_ol
             elif emg_mode == (1,0,0): #mode 3
                 uart = 0b011
         else:
-            if turn_dir == "LEFT": #turn left
+            # CHANGED: Added checks for both "MIDDLE" and "m", "LEFT" and "l", etc.
+            if turn_dir in ["LEFT", "l"]: 
                 uart = 0b101
-            elif turn_dir == "MIDDLE": #still
+            elif turn_dir in ["MIDDLE", "m"]: 
                 uart = 0b000
-            elif turn_dir == "RIGHT": #turn right
+            elif turn_dir in ["RIGHT", "r"]: 
                 uart = 0b100
+                
         return uart
 
-    else: return uart_old
+    else: 
+        return uart_old
 
 def send_data(port, data):
     ser = serial.Serial(port, 1_000_000, timeout=0)
     data += "\r\n"
     ser.write(data.encode())
-
-
-
-
-
-
-

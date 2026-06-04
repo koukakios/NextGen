@@ -23,7 +23,7 @@ class Camera:
         self.cap = cv2.VideoCapture(camera_index)
 
         #State
-        self.state = 'm'
+        self.state = "MIDDLE"
 
     def get_direction(self, startX, endX, nose_x):
         """
@@ -34,15 +34,15 @@ class Camera:
         face_center_x = startX + (face_width / 2)
         margin = face_width * self.deadzone_ratio
 
-        if nose_x < (face_center_x - margin):
+        if nose_x < (face_center_x - 0.5*margin):
             self.state = "RIGHT"
-            return "RIGHT", (255, 0, 0)  # Μπλε
+            #return "RIGHT", (255, 0, 0)  # Μπλε
         elif nose_x > (face_center_x + margin):
             self.state = "LEFT"
-            return "LEFT", (0, 0, 255)  # Κόκκινο
+            #return "LEFT", (0, 0, 255)  # Κόκκινο
         else:
             self.state = "MIDDLE"
-            return "MIDDLE", (0, 255, 0)  # Πράσινο
+            #return "MIDDLE", (0, 255, 0)  # Πράσινο
 
     def update_state(self):
         """
@@ -95,7 +95,7 @@ class Camera:
                         #cv2.circle(frame, (int(nose_x), int(nose_y)), 3, (0, 0, 255), -1)
 
                         # Κλήση της συνάρτησης για την κατεύθυνση
-                        position, color = self.get_direction(startX, endX, nose_x)
+                        self.get_direction(startX, endX, nose_x)
 
                         #cv2.putText(frame, f"Nose: {position}", (startX, startY - 10),
                                     #cv2.FONT_HERSHEY_SIMPLEX, 0.7, color, 2)

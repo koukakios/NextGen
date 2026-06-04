@@ -157,11 +157,12 @@ if __name__ == "__main__":
 
                 # 4. Calculate Motor Logic 
                 turning_mode = my_emg.turning_mode
+                
                 uart = signal_to_motor(my_mic.mic_state, my_emg.mode, my_cam.state, turning_mode, uart)
 
                 # 5. "Smart Timer" Logic for sending data to BLE
                 current_time = time.time()
-                if (current_time - last_sent_time >= 0.1) or (uart != last_sent_uart):
+                if (current_time - last_sent_time >= 0.05) or (uart != last_sent_uart):
                     byte_data = uart.to_bytes(1, 'big')
                     
                     # --- CHANGED: Push byte to Bluetooth queue instead of serial write ---
