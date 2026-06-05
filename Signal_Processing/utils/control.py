@@ -164,7 +164,7 @@ if __name__ == "__main__":
                 current_time = time.time()
                 if (current_time - last_sent_time >= 0.05) or (uart != last_sent_uart):
                     byte_data = uart.to_bytes(1, 'big')
-                    
+                
                     # --- CHANGED: Push byte to Bluetooth queue instead of serial write ---
                     try:
                         bt_queue.put_nowait(byte_data)
