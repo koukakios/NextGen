@@ -27,7 +27,6 @@ class Mic:
             data_array = np.array(chunk_to_process, dtype=np.float32)
             data_array = data_array / 32768.0
 
-            # --- NEW: VOLUME GATE ---
             # Check the maximum volume of this 1-second chunk
             max_volume = np.max(np.abs(data_array))
 
@@ -43,7 +42,7 @@ class Mic:
             self.signal_mic_change()
 
     def pre_processing(self, data, fs=16_000, samples=16_000):
-        b, a = sig.butter(3, 6_000, 'low', fs=fs)
+        b, a = sig.butter(3, 5_000, 'low', fs=fs)
         y_filtered = sig.filtfilt(b, a, data)
         y_padded = np.pad(y_filtered, (0, samples - len(y_filtered)), 'constant')
         return y_padded

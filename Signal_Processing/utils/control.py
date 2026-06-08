@@ -114,8 +114,8 @@ if __name__ == "__main__":
         deadzone_ratio=deadzone_ratio
     )
 
-    cam_thread = threading.Thread(target=camera_processing_thread, args=(my_cam,), daemon=True)
-    cam_thread.start()
+    # cam_thread = threading.Thread(target=camera_processing_thread, args=(my_cam,), daemon=True)
+    # cam_thread.start()
 
     # --- ADDED: Initialize Bluetooth Thread ---
     bt_queue = queue.Queue(maxsize=10)
@@ -151,10 +151,12 @@ if __name__ == "__main__":
                     except queue.Full: 
                         pass
 
-                # 3. Update EMG 
-                if latest_emg_list and my_mic.mic_state:
+                # 3. Update EMG - including the stopping feature.
+                if my_mic.output == 'stop':
+                    my_emg.mode = (0,0,0)
+                elif latest_emg_list and my_mic.mic_state:
                     my_emg.update_mode(latest_emg_list)
-
+                
                 # 4. Calculate Motor Logic 
                 turning_mode = my_emg.turning_mode
                 
@@ -175,8 +177,8 @@ if __name__ == "__main__":
                     last_sent_uart = uart
 
                 # 6. UI Update 
-                if latest_emg_list and not my_emg.is_collecting:
-                    print(f"EMG Gear: {my_emg.mode} | Mic: {my_mic.mic_state} | Cam: {my_cam.state}", end='\r')
+
+                print(f"EMG Gear: {my_emg.mode} | Mic: {my_mic.mic_state} | Cam: {my_cam.state}", end='\r')
             
     except KeyboardInterrupt:
         print("\n\nProgram stopped safely. Serial port closed cleanly.")
