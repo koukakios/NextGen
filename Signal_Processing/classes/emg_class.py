@@ -21,7 +21,7 @@ class EMG:
         self.event_buffer = np.array([])
         self.trigger_threshold = 0.7
         self.previous_mode = None
-        self.turning_mode = False
+        self.turning_mode = True
 
     def update_mode(self, new_data_list):
         # 1. SAFETY CHECK: Skip if no new data arrived in this loop

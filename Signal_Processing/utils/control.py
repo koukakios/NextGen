@@ -72,7 +72,7 @@ def bluetooth_processing_thread(bt_queue, address, char_uuid):
                             byte_data = bt_queue.get_nowait()
                             
                             # CHANGED: Let Bleak auto-detect the correct write property (response True/False)
-                            await client.write_gatt_char(char_uuid, byte_data)
+                            await client.write_gatt_char(char_uuid, byte_data, response=False)
                             bt_queue.task_done()
                         
                         # Yield control to the event loop
@@ -114,8 +114,8 @@ if __name__ == "__main__":
         deadzone_ratio=deadzone_ratio
     )
 
-    # cam_thread = threading.Thread(target=camera_processing_thread, args=(my_cam,), daemon=True)
-    # cam_thread.start()
+    cam_thread = threading.Thread(target=camera_processing_thread, args=(my_cam,), daemon=True)
+    cam_thread.start()
 
     # --- ADDED: Initialize Bluetooth Thread ---
     bt_queue = queue.Queue(maxsize=10)
