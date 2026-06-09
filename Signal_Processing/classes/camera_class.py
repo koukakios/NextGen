@@ -28,7 +28,7 @@ class Camera:
         # State
         self.state = "MIDDLE"
         self.color = (0, 255, 0)
-        self.state_buffer = deque(maxlen=5)
+        self.state_buffer = deque(maxlen=1)
 
     def get_direction(self, startX, endX, nose_x):
         """
