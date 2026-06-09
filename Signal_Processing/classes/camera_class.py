@@ -1,7 +1,10 @@
 import cv2
 import numpy as np
+
+from collections import deque
 from utils.Config import DNN_PROTO, DNN_MODEL, LBF_MODEL
 from utils.Config import deadzone_ratio, cam_index
+
 
 class Camera:
     def __init__(self, proto_path, model_path, landmark_path, camera_index=0, deadzone_ratio=0.06):
@@ -14,7 +17,7 @@ class Camera:
         print("Loading DNN Face Detector...")
         self.net = cv2.dnn.readNetFromCaffe(proto_path, model_path)
 
-        # Φόρτωση Dlib (LBF model για Landmarks)
+        # Φόρτωση LBF model για Landmarks
         print("Loading Facemark LBF model...")
         self.facemark = cv2.face.createFacemarkLBF()
         self.facemark.loadModel(landmark_path)
@@ -22,49 +25,61 @@ class Camera:
         # Αρχικοποίηση κάμερας
         self.cap = cv2.VideoCapture(camera_index)
 
-        #State
+        # State
         self.state = "MIDDLE"
+        self.color = (0, 255, 0)
+        self.state_buffer = deque(maxlen=5)
 
     def get_direction(self, startX, endX, nose_x):
         """
         Υπολογίζει αν το πρόσωπο κοιτάει αριστερά, δεξιά ή κέντρο.
-        Επιστρέφει το κείμενο (Position) και το χρώμα (Color).
+        Επιστρέφει το κείμενο και το χρώμα.
         """
         face_width = endX - startX
         face_center_x = startX + (face_width / 2)
         margin = face_width * self.deadzone_ratio
 
-        if nose_x < (face_center_x - 0.5*margin):
-            self.state = "RIGHT"
-            #return "RIGHT", (255, 0, 0)  # Μπλε
+        if nose_x < (face_center_x - 0.5 * margin):
+            direction = -1
         elif nose_x > (face_center_x + margin):
-            self.state = "LEFT"
-            #return "LEFT", (0, 0, 255)  # Κόκκινο
+            direction = 1
         else:
-            self.state = "MIDDLE"
-            #return "MIDDLE", (0, 255, 0)  # Πράσινο
+            direction = 0
+
+        self.state_buffer.append(direction)
+        average_direction = round(sum(self.state_buffer) / len(self.state_buffer))
+
+        states = {
+            -1: ("RIGHT", (255, 0, 0)),
+            0: ("MIDDLE", (0, 255, 0)),
+            1: ("LEFT", (0, 0, 255)),
+        }
+        self.state, self.color = states[average_direction]
+
+        return self.state, self.color
 
     def update_state(self):
         """
-        Ξεκινάει το κεντρικό loop της κάμερας.
+        Διαβάζει ένα frame από την κάμερα και ενημερώνει το state.
         """
-        # print("in camera update state")
         if not self.cap.isOpened():
             print("Error: Could not open the camera.")
-            return
-
-        #print("System ready. Press 'q' to quit.")
-
-
+            return False
 
         ret, frame = self.cap.read()
         if not ret:
-            return
+            return False
 
         h, w = frame.shape[:2]
 
         # Προετοιμασία εικόνας
-        blob = cv2.dnn.blobFromImage(frame, 1.0, (300, 300), (104.0, 177.0, 123.0))
+        blob = cv2.dnn.blobFromImage(
+            frame,
+            1.0,
+            (300, 300),
+            (104.0, 177.0, 123.0)
+        )
+
         self.net.setInput(blob)
         detections = self.net.forward()
 
@@ -82,9 +97,13 @@ class Camera:
                 if startX >= endX or startY >= endY:
                     continue
 
-                cv2.rectangle(frame, (startX, startY), (endX, endY), (0, 255, 0), 2)
+                # cv2.rectangle(frame, (startX, startY), (endX, endY), (0, 255, 0), 2)
 
-                faces = np.array([[startX, startY, endX - startX, endY - startY]], dtype=np.int32)
+                faces = np.array(
+                    [[startX, startY, endX - startX, endY - startY]],
+                    dtype=np.int32
+                )
+
                 ok, landmarks = self.facemark.fit(frame, faces)
 
                 if ok:
@@ -92,16 +111,40 @@ class Camera:
                         nose_x = marks[0][30][0]
                         nose_y = marks[0][30][1]
 
-                        #cv2.circle(frame, (int(nose_x), int(nose_y)), 3, (0, 0, 255), -1)
+                        # cv2.circle(frame, (int(nose_x), int(nose_y)), 3, (0, 0, 255), -1)
 
-                        # Κλήση της συνάρτησης για την κατεύθυνση
-                        self.get_direction(startX, endX, nose_x)
+                        # Υπολογισμός κατεύθυνσης
+                        position, color = self.get_direction(startX, endX, nose_x)
 
-                        #cv2.putText(frame, f"Nose: {position}", (startX, startY - 10),
-                                    #cv2.FONT_HERSHEY_SIMPLEX, 0.7, color, 2)
+                        # cv2.putText(
+                        #     frame,
+                        #     f"Head: {position}",
+                        #     (startX, startY - 10),
+                        #     cv2.FONT_HERSHEY_SIMPLEX,
+                        #     0.7,
+                        #     color,
+                        #     2
+                        # )
 
-        #cv2.imshow("DNN Detector (Multi-angle)", frame)
+        # Big live label on screen
+        # cv2.putText(
+        #     frame,
+        #     f"Direction: {self.state}",
+        #     (30, 50),
+        #     cv2.FONT_HERSHEY_SIMPLEX,
+        #     1.2,
+        #     self.color,
+        #     3
+        # )
 
+        # Show live camera
+        # cv2.imshow("Head Direction Camera", frame)
+
+        # Press q to quit
+        # if cv2.waitKey(1) & 0xFF == ord("q"):
+        #     return False
+
+        return True
 
     def cleanup(self):
         """
@@ -109,13 +152,11 @@ class Camera:
         """
         print("Cleaning up resources...")
         self.cap.release()
-        cv2.destroyAllWindows()
+        # cv2.destroyAllWindows()
 
 
 # --- ΕΚΤΕΛΕΣΗ ΚΩΔΙΚΑ ---
 if __name__ == "__main__":
-    # Δημιουργία του αντικειμένου και εκκίνηση
-    # Μπορείς να αλλάξεις το 0.06 εδώ απευθείας:
     detector = Camera(
         proto_path=DNN_PROTO,
         model_path=DNN_MODEL,
@@ -124,4 +165,14 @@ if __name__ == "__main__":
         deadzone_ratio=deadzone_ratio
     )
 
-    detector.update_state()
+    try:
+        print("System ready. Press 'q' to quit.")
+
+        while True:
+            keep_running = detector.update_state()
+
+            if not keep_running:
+                break
+
+    finally:
+        detector.cleanup()
