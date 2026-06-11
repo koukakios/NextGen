@@ -44,7 +44,7 @@ class EMG:
                 self.event_buffer = np.copy(new_data)
             return self.mode
 
-        # STATE 2: COLLECTING DATA FOR 1 SECOND
+        # STATE 2: COLLECTING DATA FOR 2 SECOND
         else:
             self.event_buffer = np.concatenate((self.event_buffer, new_data))
 

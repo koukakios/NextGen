@@ -98,7 +98,7 @@ if __name__ == "__main__":
     # Initialize Mic and load model
     print("Loading AI Model...")
     my_mic = Mic(fs=16_000, samples=16_000)
-    my_mic.model = load_model('model1.keras')
+    my_mic.model = load_model('model_with_stop1.keras')
 
     mic_queue = queue.Queue(maxsize=5) 
     mic_thread = threading.Thread(target=mic_processing_thread, args=(my_mic, mic_queue), daemon=True)

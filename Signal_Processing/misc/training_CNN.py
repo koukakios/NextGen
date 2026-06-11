@@ -181,7 +181,7 @@ if __name__ == "__main__":
 
     print("\nStarting Training...")
     model.fit(X_train, Y_train, validation_data=(X_val, Y_val), epochs=10, batch_size=32)
-    model.save('model_with_stop.keras')
+    model.save('model_with_stop1.keras')
 
     # 7. Evaluation
     print("\nEvaluating model on validation data...")

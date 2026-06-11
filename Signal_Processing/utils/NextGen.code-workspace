@@ -1,0 +1,12 @@
+{
+	"folders": [
+		{
+			"path": "../.."
+		},
+		{
+			"name": "Motor_control_arduino",
+			"path": "../../../../Documents/PlatformIO/Projects/Motor_control_arduino"
+		}
+	],
+	"settings": {}
+}
