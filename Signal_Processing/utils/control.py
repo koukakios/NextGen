@@ -9,6 +9,7 @@ from contextlib import ExitStack
 import asyncio
 from bleak import BleakClient
 
+
 def run_parallel_script(script_name):
     subprocess.run(["python", script_name])
 
@@ -152,15 +153,14 @@ if __name__ == "__main__":
                         pass
 
                 # 3. Update EMG - including the stopping feature.
-                if my_mic.output == 'stop':
-                    my_emg.mode = (0,0,0)
-                elif latest_emg_list and my_mic.mic_state:
+                # if my_mic.output == 'stop':
+                #     my_emg.mode = (0,0,0)
+                if latest_emg_list and my_mic.mic_state:
                     my_emg.update_mode(latest_emg_list)
-                
                 # 4. Calculate Motor Logic 
                 turning_mode = my_emg.turning_mode
                 
-                uart = signal_to_motor(my_mic.mic_state, my_emg.mode, my_cam.state, turning_mode, uart)
+                uart = signal_to_motor(True, my_emg.mode, my_cam.state, turning_mode, uart)
 
                 # 5. "Smart Timer" Logic for sending data to BLE
                 current_time = time.time()

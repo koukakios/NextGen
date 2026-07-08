@@ -9,7 +9,7 @@ class Mic:
         self.samples = samples
         self.model = model
         self.output = None
-        self.mic_state = False
+        self.mic_state = True
 
         # This will hold incoming audio chunks until we have 16,000 samples
         self.audio_buffer = []
@@ -51,7 +51,7 @@ class Mic:
         if self.model is None:
             return None
 
-        labels = ['off', 'on', 'rest']
+        labels = ['off', 'on', 'stop', 'rest']
 
         f, t, Sxx = sig.spectrogram(data, fs=fs, window='hann', nperseg=512, noverlap=265)
         Sxx_db = 10 * np.log10(Sxx + 1e-10)
